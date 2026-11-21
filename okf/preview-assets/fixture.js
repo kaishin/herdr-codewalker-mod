@@ -72,5 +72,26 @@ export default class Preview extends Codewalker {
     this.draftsLoaded = true;
     this.error = this.note = null;
     this.loading = this.reading = false;
+    const scene = "commit"; // scripts/preview.py selects the synthetic scene.
+    if (["pr", "pr-description", "pr-long-description", "no-pr"].includes(scene)) {
+      this.source = "pr";
+      this.prTab = scene === "pr" ? "changes" : "description";
+      this.prBranch = this.branch;
+      this.prHead = this.commitOid;
+      this.prBase = "7b3d1a0f0123456789abcdef0123456789abcdef01";
+      if (scene === "no-pr") {
+        this.pullRequests.previous = {branch: this.branch, pr: null};
+        this.files = this.rows = this.threads = [];
+        this.prHead = null;
+      }
+      this.pullRequest = scene === "no-pr" ? null : {
+        number: 42, title: "Make job retries safe", url: "https://github.com/example/taskboard/pull/42",
+        author: {login: "example"}, headRefName: this.branch, baseRefName: "main", state: "OPEN",
+        body: "Keep one job per unique ID, even when two workers retry at the same time.",
+        reviewDecision: "APPROVED", checks: {kind: "passed", label: "2 passed"},
+        checksList: [{name: "Unit tests", state: "SUCCESS"}, {name: "Type check", state: "SUCCESS"}],
+      };
+      if (scene === "pr-long-description") this.pullRequest.body += "\n\n## Review notes\n\n" + Array.from({length: 24}, (_, i) => `### Case ${i + 1}\n\nA retried job keeps its original ID. Workers must not insert it twice. Check the unique-key path and the failure case.`).join("\n\n");
+    }
   }
 }

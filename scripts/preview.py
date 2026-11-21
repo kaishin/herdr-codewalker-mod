@@ -26,7 +26,7 @@ def app(*args):
     return subprocess.run(["herdr-app", *args], check=True, capture_output=True, text=True).stdout
 
 
-def fixture(destination):
+def fixture(destination, scene="commit", width=900, height=620):
     destination.mkdir(parents=True, exist_ok=True)
     for name, data in regular_tree(ROOT / "mods/Codewalker").items():
         if name.endswith(".py") or name == "mod.json":
@@ -36,10 +36,10 @@ def fixture(destination):
         if name.endswith(".js"):
             data = data.replace(b"mods/Codewalker/", f"mods/{NAME}/".encode())
         target.write_bytes(data)
-    (destination / "main.js").write_bytes((ASSETS / "fixture.js").read_bytes())
+    (destination / "main.js").write_text((ASSETS / "fixture.js").read_text().replace('const scene = "commit";', f"const scene = {json.dumps(scene)};"))
     (destination / "mod.json").write_text(json.dumps({
         "place": "none", "title": "Codewalker · synthetic demo",
-        "overlay": {"kind": "window", "width": 900, "height": 620, "props": {"launch": False}},
+        "overlay": {"kind": "window", "width": width, "height": height, "props": {"launch": False}},
     }) + "\n")
 
 
@@ -102,12 +102,17 @@ def main():
     action.add_argument("--crop", type=Path, metavar="WINDOW_SHOT", help="save only the specified sanitized UI rectangle")
     action.add_argument("--compose", action="store_true", help="rebuild preview.png from the kept native screenshot")
     parser.add_argument("--rect", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
+    parser.add_argument("--scene", choices=["commit", "pr", "pr-description", "pr-long-description", "no-pr"], default="commit", help="synthetic comparison to show")
+    parser.add_argument("--width", type=int, default=900, help="native demo width in logical pixels")
+    parser.add_argument("--height", type=int, default=620, help="native demo height in logical pixels")
     args = parser.parse_args()
+    if args.width <= 0 or args.height <= 0:
+        parser.error("--width and --height must be positive")
     if args.open:
         no_symlink_ancestors(HOME, f"mods/{NAME}")
         if DESTINATION.exists():
             raise SystemExit(f"Preview folder already exists; inspect it before cleanup: {DESTINATION}")
-        fixture(DESTINATION)
+        fixture(DESTINATION, args.scene, args.width, args.height)
         (DESTINATION / OWNER).write_text(str(ROOT))
         print(app("check", str(DESTINATION)))
         print(app("do", "mod.open", "--name", NAME))
@@ -115,7 +120,7 @@ def main():
     elif args.check:
         with tempfile.TemporaryDirectory(prefix="codewalker-preview-check-") as temp:
             target = Path(temp).resolve() / "mod"
-            fixture(target)
+            fixture(target, args.scene, args.width, args.height)
             print(app("check", str(target)))
     elif args.clean:
         no_symlink_ancestors(HOME, f"mods/{NAME}")

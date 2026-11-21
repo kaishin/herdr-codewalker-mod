@@ -58,8 +58,10 @@ class BackendTests(unittest.TestCase):
         data = {"commandId": command, "expectedRevision": review["context"]["revision"], "actor": actor,
                 "scope": review["scope"], "anchor": {"path": "a.txt", "side": "new", "startLine": 2,
                 "endLine": 2, "snapshotId": review["snapshotId"]}, "body": body}
-        if review["scope"] == "commit":
+        if review["scope"] in ("commit", "pr"):
             data["commit"] = review["commitOid"]
+        if review["scope"] == "pr":
+            data["base"] = review["baseRef"]
         return self.cli("create", data=data), data
 
     def mark_file(self, review, path="a.txt", viewed=True, command="view1"):
@@ -67,10 +69,68 @@ class BackendTests(unittest.TestCase):
         data = {"commandId": command, "expectedRevision": review["context"]["revision"], "actor": HUMAN,
                 "scope": review["scope"], "base": review["baseRef"], "path": path,
                 "diffFingerprint": file["diffFingerprint"], "viewed": viewed}
-        if review["scope"] == "commit":
-            data.pop("base")
+        if review["scope"] in ("commit", "pr"):
+            if review["scope"] == "commit":
+                data.pop("base")
             data["commit"] = review["commitOid"]
         return self.cli("file-view", data=data), data
+
+    def test_pr_compares_merge_base_to_pinned_head_and_reuses_review_mutations(self):
+        ancestor = self.git("rev-parse", "HEAD")
+        self.git("switch", "-c", "feature")
+        self.changed()
+        self.git("add", ".")
+        self.git("commit", "-qm", "first PR commit")
+        (self.root / "feature.txt").write_text("second PR commit\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "second PR commit")
+        head = self.git("rev-parse", "HEAD")
+        self.git("switch", "main")
+        (self.root / "base-only.txt").write_text("not a PR change\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "advance base")
+        base = self.git("rev-parse", "HEAD")
+        # Neither checkout HEAD, its index nor its working files are the PR head.
+        (self.root / "a.txt").write_text("unrelated staged text\n")
+        self.git("add", "a.txt")
+        (self.root / "a.txt").write_text("unrelated unstaged text\n")
+        (self.root / "untracked.txt").write_text("not in the PR\n")
+        before = self.git("status", "--porcelain=v1"), (self.root / ".git/index").read_bytes()
+        args = ("--scope", "pr", "--base", base, "--commit", head)
+        review = self.cli("review", *args, "--file", "a.txt")
+        self.assertEqual(review["baseOid"], ancestor)
+        self.assertEqual(review["commitOid"], head)
+        self.assertEqual({f["path"] for f in review["files"]}, {"a.txt", "feature.txt"})
+        rows = review["file"]["hunks"][0]["rows"]
+        self.assertIn("TWO", [r["text"] for r in rows])
+        self.assertNotIn("unrelated unstaged text", [r["text"] for r in rows])
+        self.mark_file(review)
+        review = self.cli("review", *args, "--file", "a.txt")
+        self.assertTrue(next(f for f in review["files"] if f["path"] == "a.txt")["viewed"])
+        made, _ = self.create(review)
+        anchor = made["thread"]["anchor"]
+        self.assertEqual((anchor["scope"], anchor["baseRef"], anchor["commitOid"]), ("pr", base, head))
+        reply = self.cli("reply", data={"commandId":"pr-reply", "expectedRevision":made["revision"],
+            "actor":AGENT, "threadId":made["thread"]["id"], "body":"Fixed in a follow-up."})
+        self.assertEqual(reply["thread"]["anchor"]["validity"], "current")
+        again = self.cli("review", *args)
+        self.assertEqual(again["snapshotId"], review["snapshotId"])
+        self.assertEqual(again["threads"][0]["anchor"]["validity"], "current")
+        self.assertFalse(any(f["viewed"] for f in self.cli("review", "--scope", "commit", "--commit", head)["files"]))
+        # Same head and merge base, different pinned base: a separate PR checklist.
+        other = self.cli("review", "--scope", "pr", "--base", ancestor, "--commit", head)
+        self.assertFalse(any(f["viewed"] for f in other["files"]))
+        self.assertEqual((self.git("status", "--porcelain=v1"), (self.root / ".git/index").read_bytes()), before)
+
+    def test_pr_requires_full_available_commits_and_common_history(self):
+        head = self.git("rev-parse", "HEAD")
+        self.cli("review", "--scope", "pr", "--base", "main", "--commit", head, error="invalid_request")
+        self.cli("review", "--scope", "pr", "--base", head, "--commit", "f" * 40, error="pr_objects_missing")
+        self.cli("review", "--scope", "pr", "--base", head, error="invalid_request")
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        unrelated = self.git("commit-tree", tree, "-m", "unrelated root")
+        self.cli("review", "--scope", "pr", "--base", head, "--commit", unrelated, error="invalid_base")
+        self.assertEqual(self.cli("context")["revision"], 0)
 
     def test_viewed_marks_survive_restart_unrelated_changes_and_explicit_retries(self):
         review = self.changed()

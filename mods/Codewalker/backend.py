@@ -24,7 +24,7 @@ VERSION = 1
 HELPER_VERSION = 2
 # Optional protocol features a caller may use only when `hello` lists them.
 # "data-parts": repeated --data entries are joined into one mutation JSON.
-CAPABILITIES = ("data-parts", "history-clear")
+CAPABILITIES = ("data-parts", "history-clear", "pr-comparison")
 # Store schema; 2 adds messages.reply_requested, 3 adds messages.edited_at and
 # message_edits (earlier bodies), 4 adds deliveries (what was sent to an agent).
 # 5 adds file_views (explicit, per-comparison viewed-file marks).
@@ -221,6 +221,19 @@ class Git:
             parent = self.line(["hash-object", "-t", "tree", "--stdin"])
         return oid, parent, len(parents)
 
+    def pr_endpoints(self, base, head):
+        # GitHub supplies full object IDs, never local branch names. A PR compares
+        # its merge base to its head, regardless of the checked-out branch or edits.
+        for name, oid in (("base", base), ("head", head)):
+            if not isinstance(oid, str) or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", oid):
+                fail("invalid_request", f"PR {name} requires a full commit ID")
+            if not self.line(["rev-parse", "--verify", "--quiet", oid + "^{commit}"], optional=True):
+                fail("pr_objects_missing", f"PR {name} commit is not available locally. Fetch the PR history, then refresh. Codewalker never fetches or checks out automatically.", commit=oid)
+        merge_base = self.line(["merge-base", base, head], optional=True)
+        if not merge_base:
+            fail("invalid_base", "PR commits have no local common ancestor. Fetch their history, then refresh.")
+        return head, merge_base
+
     def changes(self, base_oid, target_oid=None):
         revisions = [base_oid] + ([target_oid] if target_oid else [])
         tokens = self.run(self.DIFF + ["--raw", "-z", "--no-abbrev", *revisions, "--"]).stdout.split(b"\0")
@@ -328,14 +341,17 @@ class Git:
     def _snapshot(self, scope, base, selected, select_first, commit):
         target_oid = None
         parent_count = None
-        if scope == "commit":
+        if scope == "pr":
+            target_oid, base_oid = self.pr_endpoints(base, commit)
+            base_ref = base
+        elif scope == "commit":
             if base is not None:
                 fail("invalid_request", "commit scope uses --commit, not --base")
             target_oid, base_oid, parent_count = self.commit_endpoints(commit)
             base_ref = base_oid if parent_count else "(empty tree)"
         else:
             if commit is not None:
-                fail("invalid_request", "--commit requires commit scope")
+                fail("invalid_request", "--commit requires commit or pr scope")
             base_ref, base_oid = self.endpoints(scope, base)
         entries = self.changes(base_oid, target_oid)
         contents = {}
@@ -531,6 +547,12 @@ def default_store():
     return home / "herdr-codewalker" / "reviews.sqlite3"
 
 
+def comparison_key(source):
+    if source["scope"] == "pr":
+        return source["baseRef"] + ":" + source["commitOid"]
+    return source.get("commitOid") or source["baseRef"]
+
+
 class Store:
     def __init__(self, git, path=None):
         self.git = git
@@ -637,7 +659,7 @@ class Store:
                           "SELECT id FROM threads WHERE review_id=? ORDER BY created_at,id", (self.git.review_id,))],
                       "viewedFiles": {row["path"]: row["fingerprint"] for row in self.db.execute(
                           "SELECT path,fingerprint FROM file_views WHERE review_id=? AND scope=? AND base_ref=?",
-                          (self.git.review_id, source["scope"], source.get("commitOid") or source["baseRef"]))},
+                          (self.git.review_id, source["scope"], comparison_key(source)))},
                       "drafts": [self.draft(row) for row in self.db.execute(
                           "SELECT * FROM drafts WHERE review_id=? ORDER BY updated_at,id", (self.git.review_id,))]}
             current = {entry["path"]: entry["diffFingerprint"] for entry in source["files"]}
@@ -732,7 +754,7 @@ class Store:
                     fail("invalid_request", "this file has no reliable content fingerprint")
                 if given != entry["diffFingerprint"]:
                     fail("snapshot_conflict", "this file changed; refresh before marking it viewed")
-                key = (self.git.review_id, source["scope"], source.get("commitOid") or source["baseRef"], path)
+                key = (self.git.review_id, source["scope"], comparison_key(source), path)
                 if data["viewed"]:
                     self.db.execute("INSERT OR REPLACE INTO file_views VALUES(?,?,?,?,?)", (*key, given))
                 else:
@@ -808,7 +830,7 @@ class Store:
                 source = contents = None
                 try:
                     source, contents = self.git.snapshot(thread["anchor"]["scope"],
-                        None if thread["anchor"].get("commitOid") else thread["anchor"]["baseRef"],
+                        None if thread["anchor"]["scope"] == "commit" else thread["anchor"]["baseRef"],
                         commit=thread["anchor"].get("commitOid"))
                 except Failure:
                     pass  # A missing old base cannot prevent a reply to its durable discussion.
@@ -987,7 +1009,7 @@ def open_review(repo, scope="uncommitted", base=None, commit=None):
     if "/" in terminal:
         fail("invalid_request", "open supports local Herdr terminals only")
     folder = os.path.abspath(repo or os.getcwd())
-    if scope != "commit" and commit is not None:
+    if scope not in ("commit", "pr") and commit is not None:
         fail("invalid_request", "--commit requires commit scope")
     review_props = {"framed": True, "folder": folder, "scope": scope}
     if scope == "commit":
@@ -998,6 +1020,11 @@ def open_review(repo, scope="uncommitted", base=None, commit=None):
         commit, _, _ = git.commit_endpoints(commit)
         folder = str(git.root)
         review_props.update(folder=folder, commit=commit)
+    elif scope == "pr":
+        if base is not None or commit is not None:
+            fail("invalid_request", "open --scope pr discovers the current branch's PR; do not pass --base or --commit")
+        folder = str(Git(folder).root)
+        review_props.update(folder=folder)
     elif scope == "branch":
         git = Git(folder)
         base, _ = git.endpoints(scope, base)
@@ -1040,7 +1067,7 @@ def parse_args(argv):
     parser.add_argument("--store")
     parser.add_argument("command", choices=["hello", "skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete", "history-clear"])
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch", "commit"])
+    parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch", "commit", "pr"])
     parser.add_argument("--base")
     parser.add_argument("--commit")
     parser.add_argument("--file")

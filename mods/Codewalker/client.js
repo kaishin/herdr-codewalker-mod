@@ -161,6 +161,8 @@ export class ReviewClient {
 
   async invoke(context, command, args) {
     const on = machineOf(context), helper = await this.helperFor(context);
+    if (context.source === "pr" && helper.machine && !helper.capabilities.includes("pr-comparison")) throw protocolError({ code: "remote_helper_outdated",
+      message: `The helper on ${helper.machine} cannot compare pull requests. Update it manually: ${this.installCommand(helper.machine)}` });
     const argv = [helper.path, "--repo", context.root];
     // The store override is a path on this computer; another machine keeps its own store.
     if (this.store && !on) argv.push("--store", this.store);
@@ -200,8 +202,8 @@ export class ReviewClient {
 
   sourceArgs(context) {
     const args = ["--scope", context.source ?? "uncommitted"];
-    if (context.source === "branch" && context.baseRef) args.push("--base", context.baseRef);
-    if (context.source === "commit") args.push("--commit", context.commitRef ?? "");
+    if (["branch", "pr"].includes(context.source) && context.baseRef) args.push("--base", context.baseRef);
+    if (["commit", "pr"].includes(context.source)) args.push("--commit", context.commitRef ?? "");
     return args;
   }
 
@@ -211,8 +213,8 @@ export class ReviewClient {
   async review(context, path = null) {
     const args = this.sourceArgs(context);
     const sameSource = this.latest?.machine === machineOf(context) && this.latest?.scope === (context.source ?? "uncommitted")
-      && (context.source !== "branch" || this.latest.baseRef === context.baseRef)
-      && (context.source !== "commit" || this.latest.commitOid === context.commitRef);
+      && (!["branch", "pr"].includes(context.source) || this.latest.baseRef === context.baseRef)
+      && (!["commit", "pr"].includes(context.source) || this.latest.commitOid === context.commitRef);
     const known = sameSource && context.reviewId && this.latest?.context?.reviewId === context.reviewId ? this.latest.files : null;
     // Retained discussions must never trigger an unchanged-file browsing fallback.
     let data = null;
@@ -221,6 +223,7 @@ export class ReviewClient {
       catch (error) { if (error.code !== "not_found" || error.details?.path !== path) throw error; }
     }
     data ??= await this.call(context, "review", path ? args : [...args, "--select-first"]);
+    if (context.source === "pr" && context.prBranch && data.context.branch !== context.prBranch) throw protocolError({ code: "review_conflict", message: "The current branch changed while loading its PR diff. Refresh to read that branch's PR." });
     this.latest = data;
     const detail = data.file ? fileDetail(data.file) : path ? { path, rows: [], note: RETAINED } : null;
     return {
@@ -275,7 +278,7 @@ export class ReviewClient {
       if (!entry) {
         const revision = this.revisions.get(scoped(context, context.reviewId)) ?? context.revision;
         const command = intent.threadId ? "reply" : "create";
-        const data = intent.threadId ? { threadId: intent.threadId, body } : { scope: context.source, ...(context.source === "branch" ? { base: context.baseRef } : context.source === "commit" ? { commit: context.commitRef } : {}), anchor: { path: intent.path, side: intent.anchor.side, startLine: intent.anchor.startLine, endLine: intent.anchor.endLine, snapshotId: intent.snapshotId }, body };
+        const data = intent.threadId ? { threadId: intent.threadId, body } : { scope: context.source, ...(["branch", "pr"].includes(context.source) ? { base: context.baseRef } : {}), ...(["commit", "pr"].includes(context.source) ? { commit: context.commitRef } : {}), anchor: { path: intent.path, side: intent.anchor.side, startLine: intent.anchor.startLine, endLine: intent.anchor.endLine, snapshotId: intent.snapshotId }, body };
         const payload = { commandId, reviewId: context.reviewId, expectedRevision: revision + 1, actor: HUMAN, ...data, ...(intent.replyRequested ? { replyRequested: true } : {}) };
         const receipt = { commandId, context, operation: command, payload };
         // Persist the exact post envelope BEFORE invoking it. The draft commit advances revision by one.
@@ -315,7 +318,7 @@ export class ReviewClient {
 
   setFileViewed(context, path, diffFingerprint, viewed, commandId) {
     return this.mutation(context, "file-view", { scope: context.source,
-      ...(context.source === "branch" ? { base: context.baseRef } : context.source === "commit" ? { commit: context.commitRef } : {}), path, diffFingerprint, viewed }, commandId);
+      ...(["branch", "pr"].includes(context.source) ? { base: context.baseRef } : {}), ...(["commit", "pr"].includes(context.source) ? { commit: context.commitRef } : {}), path, diffFingerprint, viewed }, commandId);
   }
 
   setStatus(context, threadId, status, commandId) {

@@ -1,9 +1,10 @@
 import { View, div, svg } from "gpui-kit";
-import { h_flex, v_flex, Button, Checkbox, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
+import { h_flex, v_flex, v_resizable, resizable_panel, Button, Checkbox, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
 import { props, spaces, panes, focused, agents, exec, run, notify, appHome, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
 import { ReviewClient, HUMAN, machineOf } from "./client.js";
+import { PullRequests } from "./pull-requests.js";
 import { dockExpand, RESTORE_TIMEOUT } from "./dock-expand.js";
-import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, activeThreads, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody } from "./model.js";
+import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, activeThreads, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody, quote } from "./model.js";
 
 const stop = (_event, cx) => cx.stop_propagation();
 // Recently viewed diffs for the current snapshot only; bounded by files and rows.
@@ -146,6 +147,10 @@ export default class Codewalker extends View {
     this.base = typeof p.base === "string" ? p.base : "";
     this.commitRef = typeof p.commit === "string" ? p.commit : "";
     this.commitOid = null;
+    this.prBase = this.prHead = this.prBranch = null;
+    this.pullRequest = null;
+    this.prTab = "description";
+    this.pullRequests = new PullRequests(exec, { cwd: this.folder, on: this.on });
     this.file = null;
     this.pendingFile = null;
     this.rowsSnapshot = null;
@@ -246,6 +251,21 @@ export default class Codewalker extends View {
       .on_click((_event, cx) => { if (enabled) action(cx); }).child(body);
   }
 
+  // Scope and PR tabs use one segmented-control style.
+  segments(id, items, selected, action, o = {}) {
+    const t = theme();
+    return h_flex().id(`${id}-segments`).min_w(0).min_h(26).flex_wrap().p(2).gap(2).items_center().rounded(7).bg(t.background).border_1().border_color(t.border)
+      .children(items.map(([value, label]) => {
+        const on = value === selected;
+        return Button.new(`${id}-${value}`).h(20).px(o.compact ? 7 : 10).rounded(5).text_size(12)
+          .bg(on ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
+          .cursor_pointer().hover(s => s.bg(on ? t.selected : t.hover).text_color(t.foreground)).disabled(Boolean(o.disabled))
+          .accessibility_label(o.label ? o.label(value, label) : label)
+          .when(Boolean(o.tooltip), el => el.tooltip(o.tooltip(value, label)))
+          .on_mouse_down("left", stop).on_click((_event, cx) => action(value, cx)).child(label);
+      }));
+  }
+
   expansionState() {
     if (this.toolbar || this.framed || props()?.overlay || !reviewPanel()?.on) return null;
     return panelExpander.state(REVIEW_DOCK);
@@ -296,17 +316,47 @@ export default class Codewalker extends View {
   }
 
   context() {
-    return { root: this.root ?? this.folder, on: this.on, source: this.source, baseRef: this.base || undefined, commitRef: this.commitOid ?? this.commitRef, reviewId: this.reviewId, snapshotId: this.snapshotId, revision: this.revision };
+    return { root: this.root ?? this.folder, on: this.on, source: this.source, ...(this.source === "pr" ? { prBranch: this.prBranch } : {}), baseRef: this.source === "pr" ? this.prBase : this.base || undefined, commitRef: this.source === "pr" ? this.prHead : this.commitOid ?? this.commitRef, reviewId: this.reviewId, snapshotId: this.snapshotId, revision: this.revision };
   }
 
   refresh(cx, quiet = false) {
+    if (this.source === "pr") {
+      if (this.folder) this.pullRequests.refresh(this, cx, quiet);
+      return;
+    }
     this.read(cx, { quiet });
+  }
+
+  applyCurrentPullRequest(result, cx, current = () => true) {
+    if (this.source !== "pr" || !current() || this.saving || this.leaving || this.sending || this.viewing || this.editing?.saving) return;
+    const { branch, pr } = result;
+    if (branch === this.prBranch && (pr?.headRefOid ?? null) === this.prHead && (pr?.baseRefOid ?? null) === this.prBase) {
+      this.pullRequests.previous = result;
+      this.pullRequest = pr;
+      this.error = null;
+      this.read(cx);
+      return;
+    }
+    this.withSavedDraft(cx, cx => {
+      if (!current() || this.source !== "pr") return;
+      this.rememberComparison();
+      if (branch !== this.prBranch || pr?.url !== this.pullRequest?.url) this.prTab = "description";
+      this.prBranch = branch;
+      this.prBase = pr?.baseRefOid ?? null;
+      this.prHead = pr?.headRefOid ?? null;
+      this.pullRequest = pr;
+      this.pullRequests.previous = result;
+      this.resetContext({ keepComparisons: true });
+      const restored = this.restoreComparison();
+      this.read(cx, { quiet: restored });
+      cx.notify();
+    });
   }
 
   // One helper read returns the file list, discussions, drafts and one file's
   // hunks. At most one read runs; a newer request replaces the queued one.
   read(cx, { path, quiet = true, retry = false, resolveCommit = false } = {}) {
-    if (!this.folder) return;
+    if (!this.folder || (this.source === "pr" && !this.prHead)) return;
     const want = { path: path === undefined ? this.pendingFile ?? this.file : path, quiet, retry, resolveCommit };
     if (!quiet) { this.loading = true; this.error = null; }
     if (this.reading) {
@@ -571,7 +621,7 @@ export default class Codewalker extends View {
   }
 
   comparisonKey() {
-    return JSON.stringify([this.folder, this.on, this.source, this.source === "branch" ? this.base : this.source === "commit" ? this.commitRef : null]);
+    return JSON.stringify([this.folder, this.on, this.source, this.source === "pr" ? [this.prBranch, this.prBase, this.prHead] : this.source === "branch" ? this.base : this.source === "commit" ? this.commitRef : null]);
   }
 
   rememberComparison() {
@@ -596,29 +646,38 @@ export default class Codewalker extends View {
   applySource(source, cx, { resolveCommit = true } = {}) {
     if (this.saving || this.leaving || this.sending || this.viewing || this.editing?.saving) return;
     const base = this.baseInput.value().trim(), commit = this.commitInput.value().trim();
+    if (source !== "pr") this.pullRequests.cancel();
     if (source === "commit" && !commit) { this.error = "Enter a commit SHA or ref."; cx.notify(); return; }
     if (source === "branch" && !base) { this.error = "Enter a local base ref before opening a branch comparison."; cx.notify(); return; }
     if (source === this.source && (source === "commit" ? !resolveCommit && this.commitRef === commit : source !== "branch" || this.base === base)) {
       this.pickBase = false;
+      this.mode = "files";
       cx.notify();
       return;
     }
     this.withSavedDraft(cx, cx => {
       this.rememberComparison();
+      this.mode = "files";
       this.source = source;
       this.pickBase = false;
       this.base = base;
       this.commitRef = commit;
       this.resetContext({ keepComparisons: true });
       const restored = this.restoreComparison();
-      this.read(cx, { quiet: restored, resolveCommit });
+      if (source === "pr") this.refresh(cx);
+      else this.read(cx, { quiet: restored, resolveCommit });
       cx.notify();
     });
   }
 
   resetContext({ keepComparisons = false } = {}) {
     this.contextVersion++;
-    if (!keepComparisons) this.comparisons.clear();
+    if (!keepComparisons) {
+      this.comparisons.clear();
+      this.prBase = this.prHead = this.prBranch = this.pullRequest = null;
+      this.prTab = "description";
+      this.pullRequests.reset({ cwd: this.folder, on: this.on });
+    }
     this.cachedComparison = false;
     this.commitOid = null;
     this.commitParents = null;
@@ -693,6 +752,7 @@ export default class Codewalker extends View {
   // A recently viewed file shows at once; otherwise the previous diff stays,
   // dimmed, until the new one arrives. No blank flash between files.
   open(path, cx) {
+    if (this.source === "pr") this.prTab = "changes";
     const hit = this.cached(path);
     if (hit) this.show(path, hit);
     else if (path !== this.file || this.rowsSnapshot !== this.snapshotId) {
@@ -718,6 +778,7 @@ export default class Codewalker extends View {
   showThread(thread, cx, reply = false) {
     const go = cx => {
       this.mode = "files";
+      if (this.source === "pr") this.prTab = "changes";
       this.focusThread = thread.id;
       this.jumpTo = { id: thread.id, path: thread.path };
       if (thread.path !== (this.pendingFile ?? this.file)) this.open(thread.path, cx);
@@ -1437,7 +1498,7 @@ export default class Codewalker extends View {
     const t = theme(), look = settings(), mono = look.font_family, fontSize = look.font_size ?? 12;
     // Follow Herdr's live code size; leave room for the 16px hover button and larger fonts.
     const rowH = Math.max(18, Math.ceil(fontSize * 1.5)), minus = row.kind === "-", plus = row.kind === "+";
-    if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(Math.max(26, rowH)).px(12).items_center().bg(t.raised).border_y(1).border_color(t.border)
+    if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(Math.max(26, rowH)).px(12).items_center().bg(t.raised)
       .font_family(mono).text_size(fontSize).text_color(t.dim).child(div().truncate().child(row.text));
     const tone = plus ? t.ansi2 : minus ? t.ansi1 : null, hovered = live && !this.drag && this.hoverRow === index;
     const number = (side, line) => div().id(`line-${index}-${side}`).w(this.cols.num).h(rowH).flex_none().flex().items_center().justify_end().pr(this.cols.num > 40 ? 8 : 5)
@@ -1491,6 +1552,25 @@ export default class Codewalker extends View {
         .when(spinning, el => el.child(div().w(12).text_size(12).text_color(t.muted).frames(SPIN, 90).child(SPIN[0])))
         .child(div().font_semibold().text_size(13).child(title)))
       .when(Boolean(body), el => el.child(div().text_size(12).text_color(t.muted).child(body)));
+  }
+
+  setPRTab(tab, cx) {
+    if (!["description", "changes"].includes(tab) || this.saving || this.leaving || this.editing?.saving) return;
+    if (this.prTab === tab && this.mode === "files") return;
+    const select = cx => { this.prTab = tab; this.mode = "files"; cx.notify(); };
+    if (tab === "description") this.withSavedDraft(cx, select);
+    else select(cx);
+  }
+
+  prEmptyView() {
+    const previous = this.pullRequests.previous;
+    const content = this.error ? div()
+      : !this.folder ? this.emptyState("Open a checkout", "Enter the absolute path of a Git checkout above.")
+      : !previous ? this.emptyState("Loading pull request…", "Checking the current branch.", true)
+      : this.emptyState("No open pull request", previous.branch === null
+        ? "Check out a branch to review its pull request."
+        : "This branch has no open pull request. Refresh after you open one.");
+    return v_flex().id("pr-empty").flex_1().min_h(0).child(content);
   }
 
   render(cx) {
@@ -1560,14 +1640,15 @@ export default class Codewalker extends View {
     const { name: fileName, dir: fileDir } = splitPath(selected ?? "");
     const pickingBase = this.source === "branch" || this.pickBase;
     const baseText = this.baseInput.value().trim(), commitText = this.commitInput.value().trim();
-    // Stacked: the file list takes what its rows need, at most about a third of the height.
+    // Initial stacked split: content-sized files, capped at about a third of the height.
+    // Native panel state keeps the user's dragged sizes across refreshes and scopes.
     const historyControl = hiddenCount > 0 || (this.filter === "all" && this.threads.length > 0);
     const listRows = Math.max(1, shownFiles.length + retainedPaths.length + draftCount) + (retainedPaths.length ? 1.25 : 0) + (draftCount ? 1.25 : 0) + (historyControl ? 1 : 0);
     const listH = Math.round(Math.min(78 + listRows * 29, Math.max(120, this.height * 0.34)));
 
     const navigator = v_flex().flex_none().min_h(0).border_color(t.border)
       .when(wide, el => el.w(sideW).border_r(1))
-      .when(!wide, el => el.h(listH).border_b(1))
+      .when(!wide, el => el.h_full().w_full())
       .child(h_flex().h(36).flex_none().px(14).gap(6).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().text_size(12).child("Changed files"))
         .child(div().text_size(11).text_color(t.dim).child(String(this.files.length)))
@@ -1595,7 +1676,7 @@ export default class Codewalker extends View {
         .when(draftCount > 0, el => el.child(this.sectionLabel("Saved drafts")))
         .children((this.drafts ?? []).map(draft => this.pathRow(`draft-${draft.id}`, draft.path, { detail: draft.intent?.anchor ? anchorLabel(draft.intent.anchor) : "", label: `Restore draft for ${draft.path}`, selected: this.intent?.id === draft.id }, cx => this.restoreDraft(draft, cx)))));
 
-    const diff = v_flex().flex_1().min_h(0).min_w(0)
+    const diff = v_flex().flex_1().min_h(0).min_w(0).when(!wide, el => el.h_full().w_full())
       .child(h_flex().h(36).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.pendingFile), el => el.child(div().w(12).flex_none().text_size(12).text_color(t.muted).frames(SPIN, 90).child(SPIN[0])))
         .child(div().min_w(0).truncate().font_semibold().text_size(12).child(fileName || "No file selected"))
@@ -1612,7 +1693,7 @@ export default class Codewalker extends View {
           this.pendingFile ? this.emptyState("Loading diff…", "", true)
           : this.reading && !this.root ? this.emptyState("Reading changes…", "", true)
           : this.file ? this.emptyState("No line changes to show", this.fileNote ? "" : "Binary, mode-only and unchanged files have no lines to comment on.")
-          : this.root && !this.files.length ? this.emptyState("Nothing to review", this.source === "commit" ? "This commit has no changes against its first parent." : this.source === "branch" ? `The working tree matches ${this.base}.` : "The working tree matches HEAD.")
+          : this.root && !this.files.length ? this.emptyState("Nothing to review", this.source === "commit" ? "This commit has no changes against its first parent." : this.source === "pr" ? "The PR head has no changes against its merge base." : this.source === "branch" ? `The working tree matches ${this.base}.` : "The working tree matches HEAD.")
           : this.root ? this.emptyState("Select a file", wide ? "Choose a changed file on the left." : "Choose a changed file above.")
           : this.emptyState("Open a checkout", "Enter the absolute path of a local Git checkout above."))))
       .when(visible.pages > 1 || visible.start > 0, el => el.child(h_flex().h(36).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border)
@@ -1641,22 +1722,19 @@ export default class Codewalker extends View {
       })
       // One compact toolbar; comparison details live in tooltips, not a title row.
       .child(h_flex().id("review-controls").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
-        .child(h_flex().flex_none().h(26).p(2).gap(2).items_center().rounded(7).bg(t.background).border_1().border_color(t.border)
-          .children([["uncommitted", "Uncommitted"], ["branch", "Branch"], ["commit", "Commit"]].map(([source, label]) => {
-            const on = source === (pickingBase ? "branch" : this.source);
-            return Button.new(`scope-${source}`).h(20).px(compact ? 7 : 10).rounded(5).text_size(12).bg(on ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
-              .cursor_pointer().hover(s => s.bg(on ? t.selected : t.hover).text_color(t.foreground)).disabled(this.saving).accessibility_label(`Compare ${label.toLowerCase()} changes`)
-              .tooltip(source === "commit" ? "First parent → selected commit · no working-tree changes"
-                : source === "uncommitted" ? "HEAD → working tree · staged, unstaged and untracked files" : `${this.base || "Choose a base ref"} → working tree · merge base ${this.resolvedBase?.slice(0, 8) ?? "…"}`)
-              .on_mouse_down("left", stop).on_click((_event, cx) => {
-                if (source === "commit") { this.applySource("commit", cx, { resolveCommit: false }); return; }
-                if (source === "uncommitted") { this.pickBase = false; this.applySource("uncommitted", cx); cx.notify(); return; }
-                if (baseText) this.applySource("branch", cx);
-                else { this.pickBase = true; this.baseInput.focus(); cx.notify(); }
-              }).child(label);
-          })))
+        .child(this.segments("scope", [["uncommitted", "Uncommitted"], ["branch", "Branch"], ["commit", "Commit"], ["pr", "Pull request"]], pickingBase ? "branch" : this.source, (source, cx) => {
+          if (source === "pr") { this.applySource("pr", cx); return; }
+          if (source === "commit") { this.applySource("commit", cx, { resolveCommit: false }); return; }
+          if (source === "uncommitted") { this.pickBase = false; this.applySource("uncommitted", cx); cx.notify(); return; }
+          if (baseText) this.applySource("branch", cx);
+          else { this.pickBase = true; this.baseInput.focus(); cx.notify(); }
+        }, { compact, disabled: this.saving, label: (_source, label) => `Compare ${label.toLowerCase()} changes`,
+          tooltip: source => source === "commit" ? "First parent → selected commit · no working-tree changes"
+            : source === "pr" ? "Merge base → selected PR head · no working-tree changes"
+            : source === "uncommitted" ? "HEAD → working tree · staged, unstaged and untracked files"
+            : `${this.base || "Choose a base ref"} → working tree · merge base ${this.resolvedBase?.slice(0, 8) ?? "…"}` }))
         .child(div().flex_1())
-        .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : "Refresh", enabled: !this.loading && !this.saving }))
+        .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : this.source === "pr" ? "Refresh the current branch’s PR and compare its latest head" : "Refresh", enabled: !this.loading && !this.pullRequests.loading && !this.saving }))
         .child(this.button("toggle-discussions", !compact && openCount ? String(openCount) : "", cx => { this.mode = this.mode === "discussions" ? "files" : "discussions"; cx.notify(); },
           { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `${this.filter === "all" ? "All" : "Active"} discussions · ${openCount} open` }))
         .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${this.on ? `${this.on}: ` : ""}${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
@@ -1666,6 +1744,17 @@ export default class Codewalker extends View {
           icon: ICON[expansion.expanded ? "minimize-2" : "maximize-2"], tooltip: expandLabel, selected: expansion.expanded,
           enabled: !expansion.restoring && expansion.reason !== "at-max",
         }))))
+      .when(this.source === "pr" && Boolean(this.pullRequest), el => el.child(h_flex().id("pr-tabs").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
+        .child(this.segments("pr-tab", [["description", "Description"], ["changes", "Changes"]], this.mode === "files" ? this.prTab : "changes", (tab, cx) => this.setPRTab(tab, cx), {
+          compact, disabled: this.saving || this.leaving || this.editing?.saving === true,
+          label: (_tab, label) => `Show pull request ${label.toLowerCase()}`,
+        }))
+        .child(div().flex_1().min_w(0))
+        .child(this.button("pr-github", `#${this.pullRequest.number}`, cx => cx.open_url(this.pullRequest.url), { small: true, tooltip: `Open pull request #${this.pullRequest.number} on GitHub` }))
+        .when(Boolean(this.error), el => el.child(this.button("pr-fetch-command", "Copy fetch command", cx => {
+          const url = this.pullRequest.url.split("/pull/")[0];
+          cx.write_to_clipboard(`git -C ${quote(this.folder)} fetch --no-tags -- ${quote(url)} ${quote(this.prBase)} ${quote(this.prHead)}`);
+        }, { small: true, tooltip: "Copy a command to fetch the pinned PR commits on the checkout's machine. Codewalker does not run it." })))))
       .when(pickingBase, el => el.child(h_flex().min_h(40).flex_none().px(14).py(7).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
             .flex_1().min_w(0)
@@ -1679,7 +1768,7 @@ export default class Codewalker extends View {
           .child(this.commitOid.slice(0, 8))))
         .child(this.button("apply-commit", "Show", cx => this.applySource("commit", cx), { enabled: !this.saving && !this.leaving && Boolean(commitText), tooltip: "Resolve this SHA or ref and show its commit diff" }))))
       // Folder entry: on request, or until a checkout loads.
-      .when(this.editRoot || (!this.root && !this.reading), el => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
+      .when(this.editRoot || (!this.folder || (this.source !== "pr" && !this.root && !this.reading)), el => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
           .child(Input.new(this.rootInput).h_full().text_size(12).text_color(t.foreground)))
         .when(this.editRoot && Boolean(this.root), el => el.child(this.button("cancel-root", "Cancel", cx => { this.editRoot = false; cx.notify(); }, { ghost: true })))
@@ -1690,11 +1779,15 @@ export default class Codewalker extends View {
       .when(Boolean(this.postNotice), el => el.child(div().flex_none().px(14).py(7).text_size(11).text_color(t.blocked).border_b(1).border_color(t.border).child(this.postNotice)))
       .when(Boolean(this.note), el => el.child(div().flex_none().px(14).py(6).text_size(11).text_color(t.muted).border_b(1).border_color(t.border).child(this.note)))
       // Side by side: h_flex centers by default, so stretch both columns or their scroll regions
-      // collapse. Stacked: the list has a fixed height and the diff takes the rest.
-      .child(this.mode === "send" ? this.sendView() : this.mode === "discussions" ? this.discussionsView(cx) : (wide ? h_flex().items_stretch() : v_flex()).flex_1().min_h(0).min_w(0).child(navigator).child(diff))
+      // collapse. Stacked: a native divider resizes files and diff without remounting editors.
+      .child(this.source === "pr" && !this.pullRequest ? this.prEmptyView() : this.mode === "send" ? this.sendView() : this.mode === "discussions" ? this.discussionsView(cx) : this.source === "pr" && this.prTab === "description" ? this.pullRequests.description(this, this.pullRequest)
+        : wide ? h_flex().items_stretch().flex_1().min_h(0).min_w(0).child(navigator).child(diff)
+        : v_resizable("review-stacked").flex_1().min_h(0).min_w(0).w_full()
+          .child(resizable_panel().size(listH).size_range(96).child(navigator))
+          .child(resizable_panel().size_range(120).child(diff)))
       .child(h_flex().h(26).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border).text_size(11)
-        .child(div().size(6).flex_none().rounded_full().bg(this.error ? t.blocked : this.reading ? t.working : t.idle))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(!this.reviewId ? (this.on ? `${this.on} · Not connected` : "Not connected")
+        .child(div().size(6).flex_none().rounded_full().bg(this.error ? t.blocked : this.reading || this.pullRequests.loading ? t.working : t.idle))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(this.source === "pr" && !this.pullRequest ? "" : !this.reviewId ? (this.on ? `${this.on} · Not connected` : "Not connected")
           : [...(this.on ? [this.on] : []), `${this.files.length} ${this.files.length === 1 ? "file" : "files"}`, `${openCount} open`, ...(awaiting ? [`${awaiting} awaiting reply`] : []), ...(draftCount ? [`${draftCount} ${draftCount === 1 ? "draft" : "drafts"}`] : [])].join(" · "))));
   }
 }

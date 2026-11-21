@@ -3,14 +3,16 @@ type: Playbook
 title: "Gallery preview"
 description: "Rebuild and safely capture the synthetic native preview and distribution artwork."
 tags: ["distribution", "preview", "privacy"]
-generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+generated: { by: "pi/1.5.2", at: "2026-11-21T23:18:23Z" }
 sources:
+  - resource: "Repository worktree: mods/Codewalker/pr-client.js, pr-model.js, pull-requests.js, main.js, client.js, backend.py, scripts/preview.py"
+    title: "Current-branch PR comparison implementation and synthetic preview"
   - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/preview.md"
     title: "Original preview.md before OKF migration"
 ---
 # Gallery preview
 
-`../preview.png` is a 2560×1280 composition based on the user's reference: marketing title/subtitle on the left and the most useful native UI on the right. Codewalker shows a commit diff, viewed checklist, and inline human–agent conversation. The background has blue/purple tints and a notebook-style dot grid; the native screenshot keeps its original colors. Text and artwork render at 2× resolution, not by enlarging the previous PNG.
+`../preview.png` is a 2560×1280 composition based on the user's reference: marketing title/subtitle on the left and the most useful native UI on the right. Codewalker shows the current PR’s Changes tab, with its viewed checklist and inline human–agent conversation. Description has its own full-height scroll tab. The background has blue/purple tints and a notebook-style dot grid; the native screenshot keeps its original colors. Text and artwork render at 2× resolution, not by enlarging the previous PNG.
 
 The kept screenshot is [`preview-assets/review.png`](preview-assets/review.png). It is a genuine native Herdr render of the production `Codewalker` view, with synthetic demo content from [`fixture.js`](preview-assets/fixture.js). No private checkout, agent transcript, or surrounding window content is included. Cropping, downscaling, a rounded mask, shadow, background, and external marketing text are the only composition operations. UI controls and code were not redrawn or generated.
 
@@ -36,12 +38,14 @@ The synthetic subclass renders actual Codewalker components. It overrides reposi
 1. Reserve the shared Herdr display before opening an overlay. The hidden check does not need a live capture slot:
 
    ```sh
-   python3 scripts/preview.py --check
-   python3 scripts/preview.py --open
+   python3 scripts/preview.py --check --scene pr
+   python3 scripts/preview.py --open --scene pr
    herdr-app shot /tmp/codewalker-native-window.png
    ```
 
-   `--open` creates only the unused `mods/Codewalker-Distribution-Preview/` in the effective `HERDR_APP_HOME`. It refuses an occupied name and changes no real mod, layout, settings, keys, tabs, or terminal. It opens a 900×620 logical-pixel window, without pointer/key automation.
+   `--scene pr` shows Changes and matches the gallery screenshot; `--scene pr-description` shows Description, and `--scene pr-long-description` supplies a long scrollable description; `--scene no-pr` checks the **No open pull request** state. The default `commit` scene remains available. These scenes use synthetic state and never call GitHub.
+
+   `--open` creates only the unused `mods/Codewalker-Distribution-Preview/` in the effective `HERDR_APP_HOME`. It refuses an occupied name and changes no real mod, layout, settings, keys, tabs, or terminal. It opens a 900×620 logical-pixel window by default, without pointer/key automation. Use `--width 400 --height 760 --scene pr` to inspect the stacked, vertically resizable PR Changes view.
 
 2. Inspect the full capture **outside the repository**. It may contain private information around the demo. Confirm the preview is listed in `herdr-app status`, then toggle that exact mod closed:
 

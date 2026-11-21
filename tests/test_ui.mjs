@@ -26,7 +26,7 @@ async function modules(overrides = {}) {
   }
   const values = {
     "gpui-kit": { View: class {}, div() {}, svg() {} },
-    "gpui-base": { h_flex() {}, v_flex() {}, Button: {}, Checkbox: {}, InputState: { new: options => new State(options) }, Input: {}, TextareaState: { new: options => new State(options) }, Textarea: {}, TextView: {} },
+    "gpui-base": { h_flex() {}, v_flex() {}, v_resizable() {}, resizable_panel() {}, Button: {}, Checkbox: {}, InputState: { new: options => new State(options) }, Input: {}, TextareaState: { new: options => new State(options) }, Textarea: {}, TextView: {} },
     herdr: { props: () => ({}), spaces: () => [], panes: () => [], focused: () => null, agents: () => [], hc: async () => { throw new Error("Unexpected hc call"); }, run() {}, notify() {}, appHome: () => "/app", home: () => "/home", theme: () => ({}), settings: () => ({}), closeOverlay() {}, layout: () => null, shared: () => undefined, setShared() {}, nextCommand: () => new Promise(() => {}), watchFolder: async () => { throw new Error("No folder watch in tests"); }, exec: async () => { throw new Error("Unexpected helper invocation"); }, ...overrides },
   };
   async function load(name) {
@@ -1462,4 +1462,176 @@ test("clearing pins the confirmed revision and refuses remote helpers without th
   const old = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 7 } });
   await assert.rejects(old.client.clearHistory(context, "no-clear"), error => error.code === "remote_helper_outdated");
   assert.equal(old.calls.some(call => call.args.includes("history-clear")), false);
+});
+
+// Current-branch PR contracts: no repository-wide list or checkout operation.
+const prFixture = (overrides = {}) => ({ number: 7, title: "Make retries safe", url: "https://github.com/example/taskboard/pull/7", state: "OPEN",
+  author: { login: "reviewer" }, headRefName: "feature", baseRefName: "main", headRefOid: "a".repeat(40), baseRefOid: "b".repeat(40),
+  body: "Use a stable job ID.", reviewDecision: "APPROVED", statusCheckRollup: [{ name: "Tests", conclusion: "SUCCESS" }], ...overrides });
+
+test("PR discovery uses gh's current branch, stays on its machine, and caches missing PRs without hiding auth failures", async () => {
+  const { load } = await modules();
+  const { PullRequestClient } = (await load(path.join(root, "mods/Codewalker/pr-client.js"))).namespace;
+  let branch = "feature", answer = prFixture(), ghError = null;
+  const calls = [];
+  const execute = async (program, args, where) => {
+    calls.push({ program, args: Array.from(args), ...where });
+    if (program === "git" && args.includes("symbolic-ref")) return { code: branch ? 0 : 1, stdout: branch || "", stderr: "" };
+    if (program === "git") return { code: 0, stdout: "origin\n", stderr: "" };
+    return ghError ? { code: 1, stderr: ghError } : { code: 0, stdout: JSON.stringify(answer) };
+  };
+  const client = new PullRequestClient(execute, { cwd: "/checkout", on: "vps" });
+  const first = await client.current(null);
+  assert.equal(first.pr.number, 7);
+  assert.equal(first.pr.checks.label, "1 passed");
+  assert.equal((await client.current(first)).pr.number, 7);
+  assert.equal(calls.filter(c => c.program === "gh").length, 1, "watch/timer refresh does not poll GitHub");
+  assert.ok(calls.every(c => c.cwd === "/checkout" && c.on === "vps"));
+  assert.ok(calls.filter(c => c.program === "gh").every(c => c.args[0] === "pr" && c.args[1] === "view" && c.args[2] === "--json"), "no PR number, list, checkout or fetch");
+  branch = "no-pr"; ghError = 'no pull requests found for branch "no-pr"';
+  const absent = await client.current(first);
+  assert.equal(absent.pr, null);
+  const before = calls.length;
+  await client.current(absent);
+  assert.equal(calls.length, before + 1, "negative cache still verifies the branch, but does not use gh");
+  ghError = "HTTP 401: Bad credentials";
+  await assert.rejects(client.current(absent, true), error => error.problem.kind === "auth");
+  branch = null;
+  assert.equal((await client.current(null, true)).pr, null, "detached HEAD has no current PR");
+  assert.equal(calls.at(-1).program, "git");
+  branch = "feature"; ghError = null; answer = prFixture({ state: "MERGED" });
+  assert.equal((await client.current(null, true)).pr, null, "a merged PR is not a current open PR");
+});
+
+test("a branch switch during PR metadata loading cannot return the old branch's PR", async () => {
+  const { load } = await modules();
+  const { PullRequestClient } = (await load(path.join(root, "mods/Codewalker/pr-client.js"))).namespace;
+  let branch = "feature";
+  const client = new PullRequestClient(async (program, args) => {
+    if (program === "git") return { code: 0, stdout: args.includes("symbolic-ref") ? branch : "origin" };
+    branch = "other";
+    return { code: 0, stdout: JSON.stringify(prFixture()) };
+  }, { cwd: "/checkout" });
+  await assert.rejects(client.current(null), /branch changed/);
+});
+
+test("PR scope saves drafts before entry, uses pinned endpoints for review, and clears the content when the branch has no PR", async () => {
+  const { view, cx, drain } = await modules();
+  let saves = 0;
+  view.client.saveDraft = async () => { saves++; return { reviewId: view.reviewId, revision: 2 }; };
+  const pr = { ...prFixture(), checks: { kind: "passed", label: "1 passed" }, checksList: [] };
+  view.pullRequests.client.current = async () => ({ branch: "feature", pr });
+  let readContext;
+  view.client.review = async context => { readContext = { ...context }; return { ...review(), branch: "feature", detail: null }; };
+  view.applySource("pr", cx);
+  await drain();
+  assert.equal(saves, 1);
+  assert.equal(view.source, "pr");
+  assert.equal(readContext.baseRef, pr.baseRefOid);
+  assert.equal(readContext.commitRef, pr.headRefOid);
+  assert.equal(readContext.prBranch, "feature");
+  assert.equal(view.pullRequest.number, 7);
+  assert.equal(view.intent, null);
+  view.pullRequests.client.current = async () => ({ branch: "no-pr", pr: null });
+  view.refresh(cx);
+  await drain();
+  assert.equal(view.pullRequest, null);
+  assert.equal(view.prHead, null);
+  assert.equal(view.files.length, 0);
+  assert.equal(view.rows.length, 0);
+  assert.equal(view.threads.length, 0);
+  assert.equal(view.error, null);
+});
+
+test("late PR answers cannot change another mode, and failed draft saves keep the original review", async () => {
+  const gate = deferred();
+  const { view, cx, drain } = await modules();
+  view.intent = null;
+  view.pullRequests.client.current = () => gate.promise;
+  view.applySource("pr", cx);
+  await settle();
+  view.applySource("uncommitted", cx);
+  gate.resolve({ branch: "feature", pr: prFixture() });
+  await drain();
+  assert.equal(view.source, "uncommitted");
+  assert.equal(view.pullRequest, null);
+  view.intent = { id: "unsaved", context: view.context() };
+  view.composer.set_value("Keep this text");
+  view.client.saveDraft = async () => { throw new Error("disk full"); };
+  view.applySource("pr", cx);
+  await drain();
+  assert.equal(view.source, "uncommitted");
+  assert.equal(view.composer.value(), "Keep this text");
+  assert.match(view.error, /disk full/);
+});
+
+test("PR reads and durable comment/viewed writes carry both endpoints; old remote helpers refuse PR comparisons", async () => {
+  const { client, calls } = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 0, capabilities: ["pr-comparison"] } });
+  const context = { root: "/checkout", on: "vps", source: "pr", reviewId: "review-a", baseRef: "b".repeat(40), commitRef: "a".repeat(40) };
+  await client.review(context);
+  const read = calls.find(call => call.args.includes("review"));
+  assert.equal(read.args[read.args.indexOf("--base") + 1], context.baseRef);
+  assert.equal(read.args[read.args.indexOf("--commit") + 1], context.commitRef);
+  await client.setFileViewed(context, "a.txt", "diff-1", true, "view-pr");
+  const intent = { id: "pr-draft", path: "a.txt", snapshotId: "snap", anchor: { side: "new", startLine: 1, endLine: 1 } };
+  await client.submit(context, intent, "Please check this.", "post-pr");
+  const mutations = calls.filter(call => call.args.includes("--data")).map(call => JSON.parse(call.args[call.args.indexOf("--data") + 1]));
+  for (const payload of mutations.filter(m => m.scope)) {
+    assert.equal(payload.scope, "pr");
+    assert.equal(payload.base, context.baseRef);
+    assert.equal(payload.commit, context.commitRef);
+  }
+  const old = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 0 } });
+  await assert.rejects(old.client.review(context), error => error.code === "remote_helper_outdated");
+  assert.equal(old.calls.length, 1, "old helper only receives hello, not an unsupported comparison");
+});
+
+test("PR tabs save a draft before Description and keep file selection, page and editor state on return", async () => {
+  const gate = deferred();
+  const { view, cx, drain } = await modules();
+  view.source = "pr";
+  view.prTab = "changes";
+  view.page = 2;
+  const rows = view.rows, intent = view.intent, file = view.file;
+  view.client.saveDraft = () => gate.promise;
+  view.setPRTab("description", cx);
+  await settle();
+  assert.equal(view.prTab, "changes", "navigation waits for the durable draft");
+  gate.resolve({ reviewId: view.reviewId, revision: 2 });
+  await drain();
+  assert.equal(view.prTab, "description");
+  assert.equal(view.intent, intent);
+  assert.equal(view.composer.value(), "Human question");
+  view.setPRTab("changes", cx);
+  assert.equal(view.prTab, "changes");
+  assert.equal(view.mode, "files");
+  assert.equal(view.file, file);
+  assert.equal(view.rows, rows);
+  assert.equal(view.page, 2);
+  assert.equal(view.intent, intent);
+  view.client.saveDraft = async () => { throw new Error("disk full"); };
+  view.setPRTab("description", cx);
+  await drain();
+  assert.equal(view.prTab, "changes", "failed saves do not hide the unsaved composer");
+  assert.match(view.error, /disk full/);
+});
+
+test("PR Description is the default for a new PR, not a forced destination on head refresh or discussion navigation", async () => {
+  const { view, cx, drain } = await modules();
+  view.source = "pr";
+  view.intent = null;
+  const pr = { ...prFixture(), checks: { kind: "passed", label: "1 passed" }, checksList: [] };
+  view.applyCurrentPullRequest({ branch: "feature", pr }, cx);
+  await drain();
+  assert.equal(view.prTab, "description");
+  view.setPRTab("changes", cx);
+  view.applyCurrentPullRequest({ branch: "feature", pr: { ...pr, headRefOid: "c".repeat(40) } }, cx);
+  await drain();
+  assert.equal(view.prTab, "changes", "head updates do not move the reviewer away from Changes");
+  view.setPRTab("description", cx);
+  view.showThread({ id: "thread", path: view.file, anchor: {side: "new", startLine: 1, endLine: 1} }, cx);
+  assert.equal(view.prTab, "changes", "Show in diff always reveals the diff, even from Description");
+  view.applyCurrentPullRequest({ branch: "another", pr: { ...pr, number: 8, url: "https://github.com/example/taskboard/pull/8" } }, cx);
+  await drain();
+  assert.equal(view.prTab, "description");
 });

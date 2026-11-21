@@ -3,8 +3,10 @@ type: Protocol
 title: "Codewalker local CLI protocol v1"
 description: "JSON CLI contracts for review reads, durable mutations, storage, and remote execution."
 tags: ["cli", "storage", "remote", "contracts"]
-generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T22:57:55Z" }
+generated: { by: "pi/1.5.2", at: "2026-11-21T13:42:12Z" }
 sources:
+  - resource: "Repository worktree: mods/Codewalker/pr-client.js, pr-model.js, pull-requests.js, main.js, client.js, backend.py, scripts/preview.py"
+    title: "Current-branch PR comparison implementation and synthetic preview"
   - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/protocol.md"
     title: "Original protocol.md before OKF migration"
   - resource: "Repository worktree: mods/Codewalker/main.js, model.js, client.js, and backend.py"
@@ -20,13 +22,13 @@ Implementation owner: backend worker; files `mods/Codewalker/backend.py`, `tests
 python3 <absolute-project>/mods/Codewalker/backend.py --repo <explicit-folder> <command> --json [options]
 ```
 
-Arguments are argv entries, never a shell string. `--repo` accepts a folder inside a Git worktree and resolves its canonical root. `--json` is accepted for every command; output is always JSON, except `skill`: it prints Markdown for agents (how to answer review threads, with the helper path and an optional `--repo` filled in), needs no review and never touches the store. `open` (in a Herdr terminal) opens Review as a pane right of that terminal, for `--repo` or the current folder; it returns `{pane, folder, scope}` with the newly created pane ID. `open --scope commit --commit <ref>` validates the local commit before changing the layout, passes the full SHA to the pane and also returns `commitOid`. `open --scope branch --base <ref>` selects a branch comparison. `open` requires a local Herdr terminal; other mods can use `pane.split` directly with the props below. Global `--store <absolute-db-path>` is an optional test/backup override. Default DB: OS user-data directory (`~/Library/Application Support/herdr-codewalker/reviews.sqlite3` on macOS; `$XDG_DATA_HOME/herdr-codewalker/reviews.sqlite3` or `~/.local/share/herdr-codewalker/reviews.sqlite3` elsewhere). Never put canonical data in overlay localStorage/cache. No tracked-source/index mutations.
+Arguments are argv entries, never a shell string. `--repo` accepts a folder inside a Git worktree and resolves its canonical root. `--json` is accepted for every command; output is always JSON, except `skill`: it prints Markdown for agents (how to answer review threads, with the helper path and an optional `--repo` filled in), needs no review and never touches the store. `open` (in a Herdr terminal) opens Review as a pane right of that terminal, for `--repo` or the current folder; it returns `{pane, folder, scope}` with the newly created pane ID. `open --scope commit --commit <ref>` validates the local commit before changing the layout, passes the full SHA to the pane and also returns `commitOid`. `open --scope branch --base <ref>` selects a branch comparison. `open --scope pr` opens the current-branch PR mode; it rejects base/commit arguments (the UI discovers those through gh). `open` requires a local Herdr terminal; other mods can use `pane.split` directly with the props below. Global `--store <absolute-db-path>` is an optional test/backup override. Default DB: OS user-data directory (`~/Library/Application Support/herdr-codewalker/reviews.sqlite3` on macOS; `$XDG_DATA_HOME/herdr-codewalker/reviews.sqlite3` or `~/.local/share/herdr-codewalker/reviews.sqlite3` elsewhere). Never put canonical data in overlay localStorage/cache. No tracked-source/index mutations.
 
 Exactly one stdout JSON value per invocation:
 
 - Success, exit 0: `{ "ok": true, "protocolVersion": 1, "data": <command-result> }`.
 - Failure, exit 1: `{ "ok": false, "protocolVersion": 1, "error": { "code": "revision_conflict", "message": "...", "details": { "expectedRevision": 2, "currentRevision": 3 } } }`.
-- Error codes: `invalid_request`, `not_repository`, `not_found`, `invalid_base`, `invalid_commit`, `snapshot_conflict`, `review_conflict`, `revision_conflict`, `idempotency_conflict`, `storage_error`, `git_error`, `too_large`. Do not parse stderr for protocol state.
+- Error codes: `invalid_request`, `not_repository`, `not_found`, `invalid_base`, `invalid_commit`, `pr_objects_missing`, `snapshot_conflict`, `review_conflict`, `revision_conflict`, `idempotency_conflict`, `storage_error`, `git_error`, `too_large`. Do not parse stderr for protocol state.
 
 ## Read commands
 
@@ -34,15 +36,17 @@ Exactly one stdout JSON value per invocation:
 
 Needs no `--repo` and never opens a store or repository. Returns `{helper, helperVersion, capabilities, python, platform, git, home, storePath}`: the helper's absolute path on its machine, its build number (2 or newer has `hello`), optional protocol features, the Python version, the Git executable or null, and the default store path. A caller on another machine uses it to find a compatible helper before any other command. A helper without `hello` answers `invalid_request`; treat that as outdated, not as missing.
 
-`capabilities` lists optional features a caller may use only when present. `history-clear` supports the human-confirmed, review-wide deletion command below. A remote helper without it must be updated manually before the UI can clear history. `data-parts`: `--data` can be repeated and the entries are joined, in order, into one mutation JSON (still at most 1 MiB). A helper without it uses only the last entry, so never repeat `--data` for it.
+`capabilities` lists optional features a caller may use only when present. `pr-comparison` enables `scope:pr` with pinned base/head SHA arguments; the UI requires this feature from a remote helper before using PR comparisons. `history-clear` supports the human-confirmed, review-wide deletion command below. A remote helper without it must be updated manually before the UI can clear history. `data-parts`: `--data` can be repeated and the entries are joined, in order, into one mutation JSON (still at most 1 MiB). A helper without it uses only the last entry, so never repeat `--data` for it.
 
 ### `context`
 
 Returns `{repoRoot, gitDir, branch, headOid, reviewId, revision, storePath}`. `branch` and `headOid` can be null (detached/unborn). `reviewId` is durable and scoped to actual canonical worktree and branch (detached HEAD has explicit identity), independent of GUI overlay/session and diff scope.
 
-### `review --scope uncommitted|branch|commit [--base <ref> | --commit <ref>] [--file <repo-relative-path> | --select-first]`
+### `review --scope uncommitted|branch|commit|pr [--base <ref> | --commit <ref>] [--file <repo-relative-path> | --select-first]`
 
-Default scope: uncommitted. Uncommitted is HEAD → net worktree (staged + unstaged + nonignored untracked). Branch is merge-base(selected base, HEAD) → worktree; includes commits **and uncommitted** changes. Base default tries origin/HEAD, main, master; no network fetch. Explicit invalid base fails. Nonignored untracked included in worktree scopes; ignored excluded. Commit scope requires `--commit <ref>` and rejects `--base`; `--commit` is rejected in other scopes. It resolves a local commit and compares its first parent to that commit (empty tree for a root). Both file contents and diff hunks come from Git objects, never the working tree/index. Merge commits use their first parent. Empty commits have no changed files. Invalid refs/non-commit objects fail `invalid_commit`; a missing first parent in shallow history fails rather than treating the commit as a root. No fetch or checkout. Paths outside the selected diff fail rather than opening a browser.
+Default scope: uncommitted. Uncommitted is HEAD → net worktree (staged + unstaged + nonignored untracked). Branch is merge-base(selected base, HEAD) → worktree; includes commits **and uncommitted** changes. Base default tries origin/HEAD, main, master; no network fetch. Explicit invalid base fails. Nonignored untracked included in worktree scopes; ignored excluded. Commit scope requires `--commit <ref>` and rejects `--base`; `--commit` is rejected in worktree scopes. It resolves a local commit and compares its first parent to that commit (empty tree for a root). Both file contents and diff hunks come from Git objects, never the working tree/index. Merge commits use their first parent. Empty commits have no changed files. Invalid refs/non-commit objects fail `invalid_commit`; a missing first parent in shallow history fails rather than treating the commit as a root. No fetch or checkout. Paths outside the selected diff fail rather than opening a browser.
+
+PR scope requires both `--base <full-base-SHA>` and `--commit <full-head-SHA>`. It compares merge-base(base, head) → head using Git objects, without worktree/index changes. Only full SHA-1/SHA-256 commit IDs are accepted. Missing commits fail `pr_objects_missing`; unavailable common history fails `invalid_base`. Nothing is fetched or checked out. The result has `baseRef` equal to the supplied base SHA, `baseOid` equal to the merge base, `commitOid`/`headOid` equal to the PR head and `parentCount:null`. Snapshot identity excludes the checkout HEAD. Reads and new-comment/viewed mutations must carry both endpoints. The Python API does not discover or contact GitHub.
 
 Result:
 
@@ -69,7 +73,7 @@ Without `--file`, `file` is null (file-list load; no hunks). With `--file`, load
 
 `files[].diffFingerprint` and `file.diffFingerprint` identify that file's old/new content, old/new paths, status and modes. They exclude whole-review snapshot/commit IDs so unrelated changes preserve a viewed mark. A null fingerprint means content identity is unavailable (for example oversized worktree bytes or unsupported special files); marking is disabled. `files[].viewed` is true only when the saved mark matches this fingerprint in the current comparison.
 
-### `list [--scope uncommitted|branch|commit] [--base <ref> | --commit <ref>]`
+### `list [--scope uncommitted|branch|commit|pr] [--base <ref> | --commit <ref>]`
 
 Returns `{reviewId,revision,threads,drafts,viewedFiles}` with freshly checked anchor validity against the selected scope. Uses the same source semantics as review. `viewedFiles` maps currently viewed paths to matching diff fingerprints; stale or absent paths are omitted.
 
@@ -92,7 +96,7 @@ Returns the list result plus `text` (readable review with locations, author, mes
 
 `replyRequested` is true when the author asked for a short reply in this thread. `awaitingReply` is true while the thread is open and its newest message has `replyRequested`. Any later message (normally the agent's reply) or resolving the thread clears it. An agent that sees `awaitingReply` posts a short `reply` (a few sentences) and then continues its work; a long discussion belongs in the agent's own session, not in the review.
 
-`status`: `open|resolved`. `anchor.validity`: `current|stale`; staleness is derived by checking scope, comparison base and both original file-side fingerprints/range evidence, not a destructive retarget. A changed file can be stale. Deleted old-side anchors remain valid while the same diff still applies. Discussions survive a file leaving the diff and can still receive replies. Commit anchors also have `commitOid`; they are current only in that exact commit comparison, even if another commit has an identical file diff. Replies/edits recheck against the anchor’s pinned commit. All scopes retain the existing worktree/checked-out-branch review identity; selecting a commit does not change that identity. Send/export identify historical commit comments so an agent does not mistake them for current working-tree lines.
+`status`: `open|resolved`. `anchor.validity`: `current|stale`; staleness is derived by checking scope, comparison base and both original file-side fingerprints/range evidence, not a destructive retarget. A changed file can be stale. Deleted old-side anchors remain valid while the same diff still applies. Discussions survive a file leaving the diff and can still receive replies. Commit and PR anchors also have `commitOid`; they are current only in that exact commit comparison, even if another commit has an identical file diff. Replies/edits recheck against the anchor’s pinned commit; PR anchors also keep their original base SHA in `baseRef`. All scopes retain the existing worktree/checked-out-branch review identity; selecting a commit does not change that identity. Send/export identify historical commit comments so an agent does not mistake them for current working-tree lines.
 
 ## Mutations (same for native UI and agents)
 
@@ -102,14 +106,14 @@ Serialize/coalesce native draft writes and thread mutations in one GUI write que
 
 | Command | Additional `--data` fields | Success data |
 | --- | --- | --- |
-| `create` | `scope`, optional `base` (branch) or required `commit` (commit scope), `anchor:{path,side,startLine,endLine,snapshotId}`, `body`, optional `replyRequested:true|false` | `{reviewId,revision,thread}` |
+| `create` | `scope`, optional `base` (branch), required `commit` (commit scope), or both `base` and `commit` (PR scope), `anchor:{path,side,startLine,endLine,snapshotId}`, `body`, optional `replyRequested:true|false` | `{reviewId,revision,thread}` |
 | `reply` | `threadId`, `body`, optional `replyRequested:true|false` | `{reviewId,revision,thread}` |
 | `resolve` | `threadId`, `resolved:true|false` (explicit set, not toggle) | `{reviewId,revision,thread}` |
 | `history-clear` | `confirmed:true`, human actor only | `{reviewId,revision,cleared:{threads:<count>}}` |
 | `edit` | `messageId`, `body` | `{reviewId,revision,thread}` |
 | `delete` | `messageId` | `{reviewId,revision,deleted:{messageId,threadId,thread},thread?}` |
 | `deliver` | `messageIds` (1–1000 distinct), `state:"uncertain"|"sent"|"none"`, optional `target` (terminal address) | `{reviewId,revision,delivered:{messageIds,state}}` |
-| `file-view` | `scope`, optional `base` (branch) or required `commit` (commit scope), `path`, `diffFingerprint`, `viewed:true|false` | `{reviewId,revision,fileView:{path,diffFingerprint,viewed,scope,baseRef,commitOid?}}` |
+| `file-view` | `scope`, optional `base` (branch), required `commit` (commit scope), or both `base` and `commit` (PR scope), `path`, `diffFingerprint`, `viewed:true|false` | `{reviewId,revision,fileView:{path,diffFingerprint,viewed,scope,baseRef,commitOid?}}` |
 | `draft-save` | `draftId` (caller-chosen stable ID), `body`, `target` (JSON object: e.g. threadId or creation anchor/scope/base) | `{reviewId,revision,draft}` |
 | `draft-delete` | `draftId` | `{reviewId,revision,draftId}` |
 
@@ -117,7 +121,7 @@ Serialize/coalesce native draft writes and thread mutations in one GUI write que
 
 The native UI hides resolved and out-of-diff threads by default; `review`, `list`, and `export` still return all discussions. Resolution and disappearance from a diff never trigger deletion.
 
-`file-view` sets a mark, never toggles blindly. Both marking and unmarking compare `diffFingerprint` with fresh file evidence; mismatches fail `snapshot_conflict`, absent paths fail `not_found`, and unavailable fingerprints fail `invalid_request`. Unrelated file changes do not reject a mark. These mutations share the write queue, optimistic revision and idempotency receipts with discussions. Marks are a shared local checklist keyed by review identity, scope, resolved base-ref **name** and path (not actor). Different base-ref names have separate checklists. Commit scope instead keys by the resolved full commit SHA; aliases of that SHA share marks, distinct commits do not. Stale marks remain stored but do not count; returning to exactly the marked file version restores the mark. Reads never prune or write marks. No forge writes occur.
+`file-view` sets a mark, never toggles blindly. Both marking and unmarking compare `diffFingerprint` with fresh file evidence; mismatches fail `snapshot_conflict`, absent paths fail `not_found`, and unavailable fingerprints fail `invalid_request`. Unrelated file changes do not reject a mark. These mutations share the write queue, optimistic revision and idempotency receipts with discussions. Marks are a shared local checklist keyed by review identity, scope, resolved base-ref **name** and path (not actor). Different base-ref names have separate checklists. Commit scope instead keys by the resolved full commit SHA; aliases of that SHA share marks, distinct commits do not. PR scope uses the supplied full base/head pair. Stale marks remain stored but do not count; returning to exactly the marked file version restores the mark. Reads never prune or write marks. No forge writes occur.
 
 Draft: `{id,actor,body,target,updatedAt}`; same durable database, no overlay identity dependency. `target` is an arbitrary JSON object capped at 512 KiB (at least 6× a valid 64 KiB body plus envelope/context allowance), enough to retain an exact pending-post receipt (`commandId`, context, operation, payload) across UI restart. The entire encoded mutation JSON is capped at 1 MiB. macOS supports the tested maximum escaped payload in one argument. Linux can impose a 128 KiB single-argument ceiling even below the helper budget: for a helper with the `data-parts` capability, the native UI sends JSON above 30,000 UTF-16 units as several `--data` entries (never splitting a surrogate pair); smaller payloads and helpers without the capability get one entry. Exec failures must retain drafts/receipts rather than regenerate a post ID. Native UI must measure encoded JSON size before execution and preserve input on transport rejection. Empty draft body is allowed. Draft deletion is idempotent state-setting (unknown ID succeeds). Drafts belong to an actor ID/kind; one actor cannot overwrite/delete another actor's draft.
 
@@ -142,7 +146,7 @@ For a checkout on another Herdr machine the native UI runs the same commands the
 
 ## Public mod props
 
-Another mod opens a comparison with `run("pane.split", {direction:"right", pane:<explicit-pane-id>, mod:"Codewalker", props:{framed:true, folder:<absolute-local-checkout>, scope:"commit", commit:<SHA-or-ref>}})`. Use `scope:"branch", base:<ref>` for a branch comparison, or `scope:"uncommitted"`. The initial read uses these props; it never opens an uncommitted comparison first. Supply a valid absolute folder. It is on this computer unless `props.on` names a machine from `hc machine ls`; the active space is never used to choose. `scope` defaults to uncommitted, but missing/invalid commit refs in commit mode produce an error rather than a worktree fallback.
+Another mod opens a comparison with `run("pane.split", {direction:"right", pane:<explicit-pane-id>, mod:"Codewalker", props:{framed:true, folder:<absolute-local-checkout>, scope:"commit", commit:<SHA-or-ref>}})`. Use `scope:"branch", base:<ref>` for a branch comparison, or `scope:"uncommitted"`. `scope:"pr"` discovers the current branch’s open PR through `gh pr view` on the checkout’s machine; it does not accept a PR number or picker. No open PR shows an empty state; metadata errors remain errors. No base/commit props are used for PR discovery. The initial read uses these props; it never opens an uncommitted comparison first. Supply a valid absolute folder. It is on this computer unless `props.on` names a machine from `hc machine ls`; the active space is never used to choose. `scope` defaults to uncommitted, but missing/invalid commit refs in commit mode produce an error rather than a worktree fallback.
 
 The same props work in layout blocks (omit `framed` for the docked card). A direct `openOverlay` call must use `props.launch:false` and explicit dialog/window dimensions; `mod.json`'s tiny launcher overlay is for the key toggle only. `mod.open` has no props argument. These calls create separate review instances and preserve any existing pane's draft.
 

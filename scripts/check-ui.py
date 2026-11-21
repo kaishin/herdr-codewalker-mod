@@ -48,6 +48,8 @@ def check_content_height(spec, stacked=False):
             regions.append(stack.copy())
         stack.append((depth, line))
     assert len(regions) == 2, "Both review scroll regions must be rendered"
+    hunks = [line for line in spec.splitlines() if ':id[Str("hunk-' in line]
+    assert hunks and all(" .border_" not in line for line in hunks), "Hunk separators keep their background but have no borders"
     common = 0
     while common < min(map(len, regions)) and regions[0][common] == regions[1][common]:
         common += 1
@@ -55,9 +57,13 @@ def check_content_height(spec, stacked=False):
     row = regions[0][common - 1][1]
     columns = [region[common][1] for region in regions]
     if stacked:
-        # Docked and narrow: files above with a fixed height, the diff takes the rest.
-        assert row.lstrip().startswith("v_flex "), "Narrow Review must stack files above the diff"
-        assert " .h[" in columns[0] and " .flex_1" in columns[1], "Stacked file list needs a fixed height; the diff fills the rest"
+        # Native panels own the drag handle and keep their sizes across repaints.
+        assert row.lstrip().startswith('v_resizable "review-stacked"'), "Every stacked comparison must have a native draggable divider"
+        assert all(column.lstrip().startswith("resizable_panel ") for column in columns), "Both files and diff belong to the resize group"
+        assert ':panel_size[Number(' in columns[0] and ':size_range[Number(96.0)]' in columns[0], "Files have an initial size and a usable minimum"
+        assert ':size_range[Number(120.0)]' in columns[1], "The diff cannot be resized away"
+        contents = [region[common + 1][1] for region in regions]
+        assert all(' .h_full' in column and ' .min_h[Number(0.0)]' in column for column in contents), "Both scroll areas must fill their resized native panels"
         return
     assert row.lstrip().startswith("h_flex "), "Review columns must share a row"
     assert " .items_stretch" in row or all(" .h_full" in column for column in columns), (
@@ -97,7 +103,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="codewalker-native-fixture-") as temp:
         destination = Path(temp).resolve() / "mod"
         destination.mkdir()
-        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "mod.json", "review.svg"):
+        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "pr-model.js", "pr-client.js", "pull-requests.js", "mod.json", "review.svg"):
             shutil.copy2(ROOT / "mods/Codewalker" / name, destination / ("view.js" if name == "main.js" else name))
         shutil.copytree(ROOT / "mods/Codewalker/icons", destination / "icons")
         # Settled; a file switch in progress (the shown diff stays, dimmed); a
@@ -126,12 +132,53 @@ def main():
         inside = 'this.width = 300; this.height = 900; this.threads = [{...this.threads[0], awaitingReply:true}];'
         # Folded, the count is the only sign of a long thread; its messages are not rendered.
         crowded = 'this.filter = "all"; this.width = 300; this.height = 900; this.threads[1] = {...this.threads[1], awaitingReply:true, messages:Array.from({length:128}, (_, i) => ({...this.threads[1].messages[0], id:`synthetic-old-${i}`}))};'
-        for pending, extra in (("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", history), ("null", clearing), ("null", uncertain), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit), ("null", remote), ("null", unfolded), ("null", inside), ("null", crowded)):
+        pr = 'this.width = 368; this.height = 900; this.source = "pr"; this.prTab = "changes"; this.prBranch = "example-feature"; this.prHead = "a".repeat(40); this.prBase = "b".repeat(40); this.pullRequest = {number:7,title:"Make retries safe",url:"https://github.com/example/taskboard/pull/7",author:{login:"example"},headRefName:"example-feature",baseRefName:"main",body:"Use a stable job ID.",checks:{kind:"passed",label:"1 passed"},checksList:[{name:"Tests",state:"SUCCESS"}],reviewDecision:"APPROVED"};'
+        pr_description = pr + ' this.prTab = "description";'
+        pr_description_wide = pr_description + ' this.width = 1100; this.pullRequest.body = "Long PR description\\n\\n".repeat(80);'
+        no_pr = 'this.width = 300; this.source = "pr"; this.pullRequest = null; this.prHead = null; this.intent = null; this.files = []; this.threads = []; this.rows = []; this.drafts = []; this.pullRequests.previous = {branch:"example-feature",pr:null};'
+        detached = no_pr + ' this.pullRequests.previous.branch = null;'
+        pr_loading = no_pr + ' this.pullRequests.previous = null; this.pullRequests.loading = true;'
+        pr_error = no_pr + ' this.pullRequests.previous = null; this.error = "Sign in to GitHub CLI";'
+        for pending, extra in (("null", pr), ("null", pr_description), ("null", pr_description_wide), ("null", no_pr), ("null", detached), ("null", pr_loading), ("null", pr_error), ("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", history), ("null", clearing), ("null", uncertain), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit), ("null", remote), ("null", unfolded), ("null", inside), ("null", crowded)):
             (destination / "main.js").write_text(FIXTURE.replace("PENDING", pending).replace("EXTRA", extra))
             result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"],
                                     check=True, capture_output=True, text=True)
             spec = result.stdout
-            narrow = extra in (expandable, docked, viewed, hidden, branch, commit, cached, remote, unfolded, inside, crowded)
+            narrow = extra in (pr, expandable, docked, viewed, hidden, branch, commit, cached, remote, unfolded, inside, crowded)
+            if extra in (no_pr, detached, pr_loading, pr_error):
+                assert 'Button "scope-pr"' in spec, "PR is the fourth comparison tab"
+                assert ':id[Str("review-diff-' not in spec and ':id[Str("pr-description-' not in spec, "A branch without an open PR has no comparison or metadata"
+                assert 'Select a pull request' not in spec, "No repository-wide picker"
+                assert ('"No open pull request"' in spec) == (extra in (no_pr, detached)), "Only a completed lookup can report an absent PR"
+                assert ('"Loading pull request…"' in spec) == (extra == pr_loading), "Initial discovery has a separate loading state"
+                if extra == no_pr:
+                    assert 'Refresh after you open one.' in spec, "The empty state explains how to get a PR"
+                if extra == detached:
+                    assert 'Check out a branch' in spec, "Detached HEAD explains how to start a PR review"
+                if extra == pr_error:
+                    assert 'Sign in to GitHub CLI' in spec, "Lookup errors remain visible instead of claiming no PR"
+                assert "WARN" not in result.stderr, result.stderr
+                continue
+            if extra in (pr, pr_description, pr_description_wide):
+                check_siblings(spec, 'Button "pr-tab-description"', 'Button "pr-tab-changes"')
+                frames = [next(line for line in spec.splitlines() if f':id[Str("{name}-segments")]' in line).split(')]', 1)[1]
+                          for name in ("scope", "pr-tab")]
+                assert frames[0] == frames[1], "PR and scope controls use the same segmented frame, spacing and colors"
+                for name in ("pr-tab-description", "pr-tab-changes"):
+                    segment = next(line for line in spec.splitlines() if f'Button "{name}"' in line)
+                    assert '.h[Number(20.0)]' in segment and '.rounded[Number(5.0)]' in segment and '.border_b[' not in segment, "PR segments match the top control instead of using underline tabs"
+                assert 'Button "pr-github"' in spec and 'Button "choose-pr"' not in spec, "Only the current PR is available"
+                assert spec.count('"#7"') == 1 and 'Open pull request #7 on GitHub' in spec, "The PR number labels the GitHub button, without a separate trailing number"
+                assert 'Hide details' not in spec, "Tabs replace the collapsible details block"
+                description = extra != pr
+                assert (':id[Str("pr-description-' in spec) == description, "Description and Changes are separate content areas"
+                if description:
+                    scroll = next(line for line in spec.splitlines() if ':id[Str("pr-description-' in line)
+                    assert '.flex_1' in scroll and '.min_h[Number(0.0)]' in scroll and ':overflow_y_scrollbar' in scroll and '.max_h' not in scroll, "Description scrolls through all remaining height, without the old fixed cap"
+                    assert ':id[Str("review-diff-' not in spec and ':id[Str("review-changed-paths")]' not in spec, "Description does not share height with the diff"
+                    assert 'Make retries safe' in spec and 'Approved' in spec and '1 passed' in spec and 'Tests' in spec
+                    assert "WARN" not in result.stderr, result.stderr
+                    continue
             if extra not in (listing, history, clearing, uncertain, sending):
                 outside = '"Discussions outside the shown lines"' in spec
                 assert outside == (extra in (unfolded, crowded)), "Only a thread with no shown line is listed outside the shown lines"
