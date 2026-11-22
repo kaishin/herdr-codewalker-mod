@@ -1,9 +1,9 @@
 {
   "renderer": "herdr-app shot; actual Codewalker native view",
   "fixture": "okf/preview-assets/fixture.js",
-  "fixtureSha256": "eef0c8a87743cacc18ce1db92105dfba2f70ffb68279ae16e95963f4f858be68",
+  "fixtureSha256": "db8186d16eb50db3a54dbded19df93d0d374220ce1995c9291237ebb38330346",
   "view": "mods/Codewalker/main.js",
-  "viewSha256": "3693920245d8caed513500118c9cab319893b36691899766dba3fbc300b0947f",
+  "viewSha256": "99cf975938116ab422f391e187b9588b5cfa9798340df5f72db91a660583794f",
   "content": "Synthetic current-branch PR Changes tab, committed diff and local inline discussion; no user repository or agent data.",
   "sourceCrop": "okf/preview-assets/review.png",
   "cropPixels": {
@@ -16,7 +16,7 @@
     3840,
     2098
   ],
-  "sourceCropSha256": "91e8950d2debe15f4c75e8981a2486c132aa4c5c48420d5656895cc0346cf667",
+  "sourceCropSha256": "7bf0a2a8b86e104b465a9354cfe8fbed86a518efb593c4f80e35e6e4fe741304",
   "composition": "scripts/preview.py --compose",
   "output": "preview.png",
   "outputPixels": [
@@ -27,7 +27,7 @@
   "reference": "https://assets.herdr.dev/previews/45ece07a1644bc44c46f8a6d9269856584737a8ea22195ad105da502ab29fa31.png",
   "privacy": "Full-window capture is deliberately not distributed. Only the inspected interior crop is kept.",
   "background": "Blue/purple tinted paper with a 24-logical-pixel notebook dot grid",
-  "viewState": "Current-branch PR Changes tab with segmented controls, numbered GitHub button and borderless hunk headers; viewSha256 identifies the captured source.",
+  "viewState": "Three top-level tabs: Uncommitted, History, Pull request. Captured PR Changes with numbered GitHub button and borderless hunk headers; viewSha256 identifies the captured source.",
   "codeFontSize": 10,
   "captureScene": "pr"
 }

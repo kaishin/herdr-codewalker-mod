@@ -1,6 +1,7 @@
 // Synthetic demo data, rendered by the real Codewalker view. No repository,
 // database, terminal-send, or network operations are available in this fixture.
 import Codewalker from "./view.js";
+import { layoutLanes } from "./lanes.js";
 
 export default class Preview extends Codewalker {
   refresh() {}
@@ -30,6 +31,7 @@ export default class Preview extends Codewalker {
     this.height = 620;
     this.folder = this.root = "/demo/taskboard";
     this.client = { saveDraft: async () => ({}), deleteDraft: async () => ({}) };
+    this.history.refresh = () => {};
     this.reviewId = "demo-review";
     this.snapshotId = this.rowsSnapshot = "demo-snapshot";
     this.revision = 3;
@@ -37,6 +39,7 @@ export default class Preview extends Codewalker {
     this.source = "commit";
     this.commitRef = this.commitOid = "8e4c2a1f0123456789abcdef0123456789abcdef01";
     this.commitParents = 1;
+    this.resolvedBase = "b".repeat(40);
     this.commitInput.set_value("8e4c2a1f");
     this.file = "src/jobs/queue.ts";
     this.rowsFingerprint = "demo-diff";
@@ -72,7 +75,25 @@ export default class Preview extends Codewalker {
     this.draftsLoaded = true;
     this.error = this.note = null;
     this.loading = this.reading = false;
+    const commits = [
+      {hash:this.commitOid, parents:["b".repeat(40), "c".repeat(40)], subject:"Make job retries safe", refs:[`HEAD -> refs/heads/${this.branch}`]},
+      {hash:"c".repeat(40), parents:["d".repeat(40)], subject:"Check concurrent retries", refs:["refs/heads/test/retries"]},
+      {hash:"b".repeat(40), parents:["d".repeat(40)], subject:"Keep one ID per job", refs:[]},
+      {hash:"d".repeat(40), parents:[], subject:"Create job queue", refs:["refs/heads/main", "refs/remotes/origin/main"]},
+    ].map((commit, i) => ({...commit, author:"Example", time:1795212000 - i * 3600}));
+    this.history.data = {defaultBase:"refs/heads/main", defaultBaseKind:"fallback", root:this.root, branch:this.branch, head:this.commitOid, commits, branches:[
+      {ref:`refs/heads/${this.branch}`, name:this.branch, hash:this.commitOid, remote:false},
+      {ref:"refs/heads/main", name:"main", hash:"d".repeat(40), remote:false},
+      {ref:"refs/remotes/origin/main", name:"origin/main", hash:"d".repeat(40), remote:true},
+    ]};
+    this.history.graph = layoutLanes(commits);
+    this.base = "main";
+    this.baseInput.set_value("main");
     const scene = "commit"; // scripts/preview.py selects the synthetic scene.
+    if (scene === "history-branch") this.source = "branch";
+    if (scene === "history-branches") this.history.picking = true;
+    if (scene === "history-edit-base") { this.source = "branch"; this.history.entry = "base"; }
+    if (scene === "history-go-commit") this.history.entry = "commit";
     if (["pr", "pr-description", "pr-long-description", "no-pr"].includes(scene)) {
       this.source = "pr";
       this.prTab = scene === "pr" ? "changes" : "description";

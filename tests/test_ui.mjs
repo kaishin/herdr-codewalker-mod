@@ -1,7 +1,9 @@
 // Run: node --experimental-vm-modules --test tests/test_ui.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -25,8 +27,8 @@ async function modules(overrides = {}) {
     focus() {}
   }
   const values = {
-    "gpui-kit": { View: class {}, div() {}, svg() {} },
-    "gpui-base": { h_flex() {}, v_flex() {}, v_resizable() {}, resizable_panel() {}, Button: {}, Checkbox: {}, InputState: { new: options => new State(options) }, Input: {}, TextareaState: { new: options => new State(options) }, Textarea: {}, TextView: {} },
+    "gpui-kit": { View: class {}, div() {}, svg() {}, PathBuilder: {} },
+    "gpui-base": { h_flex() {}, v_flex() {}, v_resizable() {}, resizable_panel() {}, Button: {}, Checkbox: {}, InputState: { new: options => new State(options) }, Input: {}, TextareaState: { new: options => new State(options) }, Textarea: {}, TextView: {}, v_virtual_list() {}, Scrollbar: {}, VirtualListScrollHandle: { new: () => ({ scroll_to_item() {} }) } },
     herdr: { props: () => ({}), spaces: () => [], panes: () => [], focused: () => null, agents: () => [], hc: async () => { throw new Error("Unexpected hc call"); }, run() {}, notify() {}, appHome: () => "/app", home: () => "/home", theme: () => ({}), settings: () => ({}), closeOverlay() {}, layout: () => null, shared: () => undefined, setShared() {}, nextCommand: () => new Promise(() => {}), watchFolder: async () => { throw new Error("No folder watch in tests"); }, exec: async () => { throw new Error("Unexpected helper invocation"); }, ...overrides },
   };
   async function load(name) {
@@ -1634,4 +1636,213 @@ test("PR Description is the default for a new PR, not a forced destination on he
   view.applyCurrentPullRequest({ branch: "another", pr: { ...pr, number: 8, url: "https://github.com/example/taskboard/pull/8" } }, cx);
   await drain();
   assert.equal(view.prTab, "description");
+});
+
+test("History selections save the draft before changing comparison, and return to the last pinned commit", async () => {
+  const saved = deferred(), contexts = [], oid = "a".repeat(40);
+  const { view, cx, drain } = await modules({ client: {
+    saveDraft: () => saved.promise,
+    review: async context => { contexts.push({ ...context }); return { ...review(), commitOid: context.source === "commit" ? context.commitRef : null, parentCount: 1 }; },
+  } });
+  view.source = "commit"; view.commitRef = "HEAD"; view.intent.context = view.context();
+  view.history.data = { commits: [{ hash: oid }] };
+  assert.equal(view.history.onKey(view, { key: "down" }, cx), false, "Arrow keys in an open composer must not navigate history");
+  view.history.picking = true;
+  view.history.activate(view, "branch", { ref: "refs/heads/main" }, cx);
+  assert.equal(view.source, "commit");
+  assert.equal(view.history.picking, true);
+  assert.equal(view.baseInput.value(), "");
+  saved.resolve({ reviewId: "review-a", revision: 2 });
+  await drain();
+  assert.equal(view.source, "branch");
+  assert.equal(view.base, "refs/heads/main");
+  assert.equal(view.baseInput.value(), "refs/heads/main");
+  assert.equal(view.history.picking, false);
+  assert.equal(contexts.at(-1).baseRef, "refs/heads/main");
+  view.history.data = { commits: [{ hash: oid }], branches: [{ ref: "refs/heads/main", name: "main" }, { ref: "refs/heads/topic", name: "topic" }] };
+  view.history.picking = true;
+  view.history.search.set_value("topic");
+  assert.equal(view.history.onKey(view, { key: "enter" }, cx), true);
+  await drain();
+  assert.equal(view.base, "refs/heads/topic", "Enter selects the filtered branch, not a commit from the tree");
+  view.history.activate(view, "commit", { hash: oid }, cx);
+  await drain();
+  assert.equal(view.commitOid, oid);
+  assert.equal(view.commitInput.value(), oid);
+  // Unsubmitted input must not move the saved History comparison on re-entry.
+  view.commitInput.set_value("HEAD~9");
+  view.applySource("uncommitted", cx);
+  await drain();
+  view.applyHistory(cx);
+  await drain();
+  assert.equal(view.source, "commit");
+  assert.equal(view.commitOid, oid);
+  assert.equal(contexts.at(-1).commitRef, oid);
+  view.baseInput.set_value("main~1");
+  view.applySource("branch", cx);
+  await drain();
+  assert.equal(view.base, "main~1", "manual refs use the same branch comparison as picker selections");
+  view.baseInput.set_value("unsubmitted-ref");
+  view.applySource("uncommitted", cx);
+  await drain();
+  view.applyHistory(cx);
+  await drain();
+  assert.equal(view.base, "main~1");
+});
+
+test("a failed draft save leaves the History picker, manual refs, and current comparison unchanged", async () => {
+  const { view, cx, drain } = await modules({ client: { saveDraft: async () => { throw new Error("disk full"); } } });
+  view.source = "branch"; view.base = "main"; view.intent.context = view.context();
+  view.history.picking = true;
+  view.history.activate(view, "commit", { hash: "b".repeat(40) }, cx);
+  await drain();
+  assert.equal(view.source, "branch");
+  assert.equal(view.commitInput.value(), "HEAD");
+  assert.equal(view.file, "a.txt");
+  assert.equal(view.composer.value(), "Human question");
+  assert.equal(view.history.picking, true);
+  assert.match(view.error, /disk full/);
+});
+
+test("late History snapshots cannot replace another mode or another machine's checkout", async () => {
+  const first = deferred(), second = deferred();
+  const { view, cx, drain } = await modules();
+  view.intent = null; view.composer.set_value(""); view.source = "branch"; view.base = "main";
+  view.history.client = { snapshot: () => first.promise };
+  view.history.refresh(view, cx);
+  await settle();
+  view.applySource("uncommitted", cx);
+  first.resolve({ commits: [], branches: [], root: "/old-checkout" });
+  await drain();
+  assert.equal(view.history.data, null);
+  view.source = "commit";
+  view.history.client = { snapshot: () => second.promise };
+  view.history.refresh(view, cx);
+  await settle();
+  view.on = "other-machine"; view.resetContext();
+  second.resolve({ commits: [], branches: [], root: "/old-checkout" });
+  await drain();
+  assert.equal(view.history.data, null);
+  assert.equal(view.history.loading, false);
+  assert.equal(view.history.client.where.on, "other-machine");
+});
+
+test("History reads a real merge graph and local/remote branches without changing Git or worktree state", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "codewalker-history-"));
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    git("init", "-b", "main"); git("config", "user.name", "Example"); git("config", "user.email", "example@example.test");
+    await writeFile(path.join(directory, "base.txt"), "base\n"); git("add", "."); git("commit", "-m", "Root");
+    git("switch", "-c", "topic"); await writeFile(path.join(directory, "topic.txt"), "topic\n"); git("add", "."); git("commit", "-m", "Topic");
+    git("switch", "main"); await writeFile(path.join(directory, "main.txt"), "main\n"); git("add", "."); git("commit", "-m", "Main");
+    git("merge", "--no-ff", "topic", "-m", "Merge topic");
+    git("update-ref", "refs/remotes/origin/topic", "topic"); git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/topic");
+    await writeFile(path.join(directory, "base.txt"), "unsaved edit\n");
+    const head = git("rev-parse", "HEAD"), refs = git("show-ref"), index = await readFile(path.join(directory, ".git/index"));
+    const { load } = await modules();
+    const module = await load(path.join(root, "mods/Codewalker/history-client.js")); await module.evaluate();
+    const execute = async (program, args, options) => {
+      assert.equal(program, "git"); assert.equal(options.on, "build"); assert.equal(options.cwd, "/checkout");
+      const result = spawnSync(program, args, { cwd: directory, encoding: "utf8" });
+      return { code: result.status, stdout: result.stdout, stderr: result.stderr };
+    };
+    const client = new module.namespace.HistoryClient(execute, { cwd: "/checkout", on: "build" });
+    const data = await client.snapshot();
+    assert.equal(data.branch, "main"); assert.equal(data.head, head); assert.equal(data.commits.length, 4);
+    assert.equal(data.commits[0].parents.length, 2);
+    assert.equal(data.defaultBase, "refs/remotes/origin/topic", "Use the remote HEAD, not a hard-coded main branch");
+    assert.equal(data.defaultBaseKind, "remote");
+    assert.deepEqual(Array.from(data.branches, b => b.name).sort(), ["main", "origin/topic", "topic"]);
+    const lanes = await load(path.join(root, "mods/Codewalker/lanes.js")); await lanes.evaluate();
+    const graph = lanes.namespace.layoutLanes(data.commits);
+    assert.ok(graph.width >= 2, "merge parents occupy distinct lanes, not a fake straight rail");
+    assert.equal(graph.rows.length, data.commits.length);
+    assert.equal(git("show-ref"), refs); assert.equal(git("rev-parse", "HEAD"), head);
+    assert.deepEqual(await readFile(path.join(directory, ".git/index")), index);
+    assert.equal(await readFile(path.join(directory, "base.txt"), "utf8"), "unsaved edit\n");
+    git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD");
+    const fallback = await client.snapshot();
+    assert.equal(fallback.defaultBase, "refs/heads/main"); assert.equal(fallback.defaultBaseKind, "fallback");
+    git("branch", "-m", "main", "trunk");
+    assert.equal((await client.snapshot()).defaultBase, null, "Do not invent a default when none is known locally");
+    git("switch", "--detach"); assert.equal((await client.snapshot()).branch, null);
+    // The status double-read rejects a mixed snapshot if another process moves HEAD.
+    let reads = 0;
+    client.execute = async (...args) => { if (args[1].includes("status") && ++reads === 2) git("reset", "--soft", "HEAD~1"); return execute(...args); };
+    await assert.rejects(client.snapshot(), /checkout changed/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("Branch vs default leaves commit review only after saving the draft, and asks for a base when unknown", async () => {
+  let fail = true;
+  const contexts = [];
+  const { view, cx, drain } = await modules({ client: {
+    saveDraft: async () => { if (fail) throw new Error("disk full"); return { reviewId: "review-a", revision: 2 }; },
+    review: async context => { contexts.push({ ...context }); return review(); },
+  } });
+  view.source = "commit"; view.commitOid = view.commitRef = "a".repeat(40);
+  view.base = "refs/heads/custom";
+  view.baseInput.set_value("unsubmitted-base");
+  view.intent.context = view.context();
+  view.history.data = { defaultBase: "refs/remotes/origin/main", defaultBaseKind: "remote" };
+  view.history.compareBranch(view, cx);
+  await drain();
+  assert.equal(view.source, "commit");
+  assert.equal(view.base, "refs/heads/custom");
+  assert.equal(view.composer.value(), "Human question");
+  assert.match(view.error, /disk full/);
+  fail = false;
+  view.history.compareBranch(view, cx);
+  await drain();
+  assert.equal(view.source, "branch");
+  assert.equal(view.base, "refs/remotes/origin/main");
+  assert.equal(contexts.at(-1).baseRef, "refs/remotes/origin/main");
+  assert.equal(view.baseInput.value(), "refs/remotes/origin/main");
+  view.source = "commit"; view.commitOid = "a".repeat(40);
+  view.history.data = { defaultBase: null };
+  view.history.compareBranch(view, cx);
+  assert.equal(view.history.entry, "base");
+  assert.equal(view.source, "commit", "An unknown default must not silently substitute HEAD or another base");
+  assert.equal(view.base, "refs/remotes/origin/main");
+});
+
+test("History ref editors are exclusive, cancel without navigating, and close only after a successful comparison change", async () => {
+  let fail = true, submits = 0;
+  const { view, cx, drain } = await modules({ client: {
+    saveDraft: async () => { if (fail) throw new Error("disk full"); return { reviewId: "review-a", revision: 2 }; },
+  } });
+  view.source = "branch"; view.base = "main";
+  view.baseInput.set_value("main"); view.commitInput.set_value("HEAD~1");
+  view.intent.context = view.context();
+  view.history.openEntry("base", view, cx);
+  assert.equal(view.history.entry, "base");
+  view.history.openEntry("commit", view, cx);
+  assert.equal(view.history.entry, "commit");
+  assert.equal(view.baseInput.value(), "main");
+  assert.equal(view.commitInput.value(), "HEAD~1");
+  assert.equal(view.source, "branch", "Opening an editor does not change the active comparison");
+  cx.stop_propagation = () => submits++;
+  view.commitInput.handlers.submit({}, cx);
+  await drain();
+  assert.equal(view.history.entry, "commit", "A failed draft save keeps the editor and old comparison");
+  assert.equal(view.source, "branch");
+  assert.equal(view.composer.value(), "Human question");
+  fail = false;
+  view.commitInput.handlers.submit({}, cx);
+  await drain();
+  assert.equal(view.source, "commit");
+  assert.equal(view.commitRef, "HEAD~1");
+  assert.equal(view.history.entry, null);
+  assert.equal(submits, 2, "Submitting a ref consumes Enter instead of also selecting a tree row");
+  view.history.openEntry("commit", view, cx);
+  view.history.openBranches(view, cx);
+  assert.equal(view.history.entry, null, "Native branch search replaces the manual editor");
+  assert.equal(view.history.picking, true);
+  view.history.dismiss();
+  assert.equal(view.history.picking, false);
+  assert.equal(view.source, "commit", "Closing a picker does not change the displayed diff");
 });

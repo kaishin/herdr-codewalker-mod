@@ -3,8 +3,10 @@ type: Playbook
 title: "Gallery preview"
 description: "Rebuild and safely capture the synthetic native preview and distribution artwork."
 tags: ["distribution", "preview", "privacy"]
-generated: { by: "pi/1.5.2", at: "2026-11-21T23:18:23Z" }
+generated: { by: "pi/1.5.2", at: "2026-11-22T01:08:28Z" }
 sources:
+  - resource: "Repository worktree: mods/Codewalker/history.js, history-client.js, history-model.js, lanes.js, main.js, scripts/check-ui.py, scripts/preview.py"
+    title: "Unified History controls, read-only Git discovery, native graph and preview scenes"
   - resource: "Repository worktree: mods/Codewalker/pr-client.js, pr-model.js, pull-requests.js, main.js, client.js, backend.py, scripts/preview.py"
     title: "Current-branch PR comparison implementation and synthetic preview"
   - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/preview.md"
@@ -43,7 +45,7 @@ The synthetic subclass renders actual Codewalker components. It overrides reposi
    herdr-app shot /tmp/codewalker-native-window.png
    ```
 
-   `--scene pr` shows Changes and matches the gallery screenshot; `--scene pr-description` shows Description, and `--scene pr-long-description` supplies a long scrollable description; `--scene no-pr` checks the **No open pull request** state. The default `commit` scene remains available. These scenes use synthetic state and never call GitHub.
+   `--scene pr` shows Changes and matches the gallery screenshot; `--scene pr-description` shows Description, and `--scene pr-long-description` supplies a long scrollable description; `--scene no-pr` checks the **No open pull request** state. The default `commit` scene shows the unified History tab and a synthetic merge graph; `--scene history-branch` shows branch/default endpoints, `--scene history-branches` opens its base picker, and `--scene history-edit-base` shows the single base editor, and `--scene history-go-commit` shows the separate commit editor. Use `--width 400 --height 760` for narrow History checks. These scenes use synthetic state and never call GitHub.
 
    `--open` creates only the unused `mods/Codewalker-Distribution-Preview/` in the effective `HERDR_APP_HOME`. It refuses an occupied name and changes no real mod, layout, settings, keys, tabs, or terminal. It opens a 900×620 logical-pixel window by default, without pointer/key automation. Use `--width 400 --height 760 --scene pr` to inspect the stacked, vertically resizable PR Changes view.
 
