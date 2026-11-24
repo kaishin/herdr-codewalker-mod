@@ -46,6 +46,14 @@ export default class Fixture extends Codewalker {
 '''
 
 
+STRANDED = "a reload stranded script tasks that will never settle"
+
+
+def warnings(stderr):
+    """stderr without the check harness's own reload notice."""
+    return "\n".join(line for line in stderr.splitlines() if STRANDED not in line)
+
+
 def check_content_height(spec, stacked=False):
     # Inspect the runtime-built description, not source text. gpui-base h_flex
     # centers children by default: these two columns must instead fill its height
@@ -84,6 +92,31 @@ def check_content_height(spec, stacked=False):
     )
 
 
+def check_walkthrough_height(spec, stacked):
+    """The outline and the step scroll in two regions that fill one row or resize group."""
+    lines = spec.splitlines()
+    depth = lambda i: len(lines[i]) - len(lines[i].lstrip())
+
+    def ancestors(i):
+        chain, level = [], depth(i)
+        for j in range(i - 1, -1, -1):
+            if lines[j].strip() and depth(j) < level:
+                chain.append(j)
+                level = depth(j)
+        return chain
+
+    regions = [next(i for i, line in enumerate(lines) if marker in line)
+               for marker in (':id[Str("walkthrough-outline")]', ':id[Str("walkthrough-content-')]
+    for i in regions:
+        assert ' .flex_1' in lines[i] and ' .min_h[Number(0.0)]' in lines[i] and ':overflow_y_scrollbar' in lines[i], "Both walkthrough regions scroll in the remaining height"
+    common = next(j for j in ancestors(regions[0]) if j in ancestors(regions[1]))
+    row = lines[common].lstrip()
+    if stacked:
+        assert row.startswith('v_resizable "walkthrough-stacked"'), "A narrow walkthrough stacks the outline over the step with a native divider"
+    else:
+        assert row.startswith("h_flex ") and " .items_stretch" in row, "A wide walkthrough keeps the outline beside the step at full height"
+
+
 def check_siblings(spec, *names):
     """The named elements share one parent row, in this order."""
     lines = spec.splitlines()
@@ -110,17 +143,45 @@ def check_thread_header(spec, thread, open):
     assert (" .border_b[" in header) == open, "Only an open card draws a divider under its header"
 
 
+WALK = r"""
+    const wt = {id:"synthetic-walkthrough", title:"How retries became safe", summary:"Synthetic fixture: **two** edits make retries idempotent.", status:"open",
+      author:{kind:"agent",id:"example",name:"Example agent"}, createdAt:"2026-01-01T10:00:00Z", updatedAt:"2026-01-01T10:05:00Z", steps:[]};
+    const agent = {kind:"agent",id:"example",name:"Example agent"}, human = {kind:"human",id:"local",name:"You"};
+    const thread = (n, body, extra = {}) => ({id:`synthetic-step-thread-${n}`, path:[null, "src/example.py", "src/caller.py"][n], status:"open", awaitingReply:false, outdated:n === 2,
+      anchor:{walkthroughId:wt.id, stepId:`step-${n}`, validity:n === 2 ? "stale" : "current"},
+      walkthrough:{id:wt.id, title:wt.title, stepId:`step-${n}`, position:n, stepTitle:["Overview","Stable job ID","Caller"][n], stepCount:3},
+      messages:[{id:`synthetic-step-body-${n}`, actor:agent, body, createdAt:"2026-01-01T10:00:00Z"}], ...extra});
+    wt.steps = [
+      {id:"step-0", position:0, title:"Overview", view:null, validity:"current", thread:thread(0, "Synthetic fixture: read this **first**.")},
+      {id:"step-1", position:1, title:"Stable job ID", validity:"current",
+        view:{kind:"diff", path:"src/example.py", oldPath:null, status:"modified", side:"new", startLine:1, endLine:1,
+          hunks:[{rows:[{kind:"delete",oldLine:1,newLine:null,text:"old_value = 1"},{kind:"add",oldLine:null,newLine:1,text:"new_value = 2"}]}]},
+        thread:thread(1, "Synthetic fixture: the ID now comes from the payload.", {messages:[
+          {id:"synthetic-step-body-1", actor:agent, body:"Synthetic fixture: the ID now comes from the payload.", createdAt:"2026-01-01T10:00:00Z"},
+          {id:"synthetic-step-reply", actor:human, body:"Synthetic fixture: what if the payload has no ID?", createdAt:"2026-01-01T10:02:00Z"}]})},
+      {id:"step-2", position:2, title:"Caller", validity:"stale",
+        view:{kind:"source", path:"src/caller.py", rev:"head", startLine:10, endLine:12,
+          hunks:[{rows:[{kind:"context",oldLine:null,newLine:10,text:"queue.retry(job)"}]},{rows:[{kind:"context",oldLine:null,newLine:12,text:"queue.flush()"}]}]},
+        thread:thread(2, "Synthetic fixture: the caller is unchanged.")},
+    ];
+    this.walkthroughId = wt.id; this.walkthrough = wt; this.step = 1;
+    this.threads = wt.steps.map(step => step.thread); this.files = []; this.rows = []; this.drafts = [];
+    this.intent = null; this.composer.set_value(""); this.history.data = this.history.graph = null;
+"""
+SUMMARY = 'this.walkthroughs = [{id:"synthetic-walkthrough", title:"How retries became safe", summary:"", status:"open", author:{kind:"agent",id:"example",name:"Example agent"}, createdAt:"2026-01-01T10:00:00Z", updatedAt:"2026-01-01T10:05:00Z", stepCount:3, openThreads:3, awaitingReply:1, replies:1}, {id:"synthetic-archived", title:"Old queue notes", summary:"", status:"archived", author:{kind:"agent",id:"example",name:"Example agent"}, createdAt:"2025-12-01T10:00:00Z", updatedAt:"2025-12-01T10:05:00Z", stepCount:1, openThreads:0, awaitingReply:0, replies:0}];'
+
+
 def main():
     # Source is the reviewed authored module; no downloaded helpers or live app configuration.
     with tempfile.TemporaryDirectory(prefix="codewalker-native-fixture-") as temp:
         destination = Path(temp).resolve() / "mod"
         destination.mkdir()
-        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "pr-model.js", "pr-client.js", "pull-requests.js", "history.js", "history-client.js", "history-model.js", "lanes.js", "mod.json", "review.svg"):
+        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "pr-model.js", "pr-client.js", "pull-requests.js", "history.js", "history-client.js", "history-model.js", "lanes.js", "walkthrough.js", "walkthrough-model.js", "mod.json", "review.svg"):
             shutil.copy2(ROOT / "mods/Codewalker" / name, destination / ("view.js" if name == "main.js" else name))
         shutil.copytree(ROOT / "mods/Codewalker/icons", destination / "icons")
         # Settled; a file switch in progress (the shown diff stays, dimmed); a
         # hovered row while a new two-line comment is open; docked at the
-        # panel's default width with a thread awaiting a short reply.
+        # panel's default width with a thread awaiting a reply in thread.
         hover = 'this.hoverRow = 2; this.intent = {...this.intent, threadId:null, anchor:{side:"new",startLine:1,endLine:2}};'
         docked = 'this.width = 368; this.height = 900; this.threads[0] = {...this.threads[0], awaitingReply:true}; this.intent = {...this.intent, replyRequested:true};'
         listing = 'this.width = 368; this.height = 900; this.mode = "discussions";'
@@ -173,7 +234,7 @@ def main():
                     assert 'Check out a branch' in spec, "Detached HEAD explains how to start a PR review"
                 if extra == pr_error:
                     assert 'Sign in to GitHub CLI' in spec, "Lookup errors remain visible instead of claiming no PR"
-                assert "WARN" not in result.stderr, result.stderr
+                assert "WARN" not in warnings(result.stderr), result.stderr
                 continue
             if extra in (pr, pr_description, pr_description_wide):
                 check_siblings(spec, 'Button "pr-tab-description"', 'Button "pr-tab-changes"')
@@ -193,7 +254,7 @@ def main():
                     assert '.flex_1' in scroll and '.min_h[Number(0.0)]' in scroll and ':overflow_y_scrollbar' in scroll and '.max_h' not in scroll, "Description scrolls through all remaining height, without the old fixed cap"
                     assert ':id[Str("review-diff-' not in spec and ':id[Str("review-changed-paths")]' not in spec, "Description does not share height with the diff"
                     assert 'Make retries safe' in spec and 'Approved' in spec and '1 passed' in spec and 'Tests' in spec
-                    assert "WARN" not in result.stderr, result.stderr
+                    assert "WARN" not in warnings(result.stderr), result.stderr
                     continue
             if extra not in (listing, history, clearing, uncertain, sending):
                 outside = '"Discussions outside the shown lines"' in spec
@@ -207,6 +268,7 @@ def main():
             root = next(i for i, line in enumerate(lines) if ':id[Str("codewalker")]' in line)
             assert ':id[Str("review-controls")]' in lines[root + 1], "Scope and actions are the first row; no title row above them"
             check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"')
+            assert 'Button "toggle-walkthroughs"' not in spec, "Walkthroughs are offered only when an agent wrote one"
             assert ('Button "expand-review"' in spec) == (extra in (expandable, expanded)), "Expand is offered only for supported docked views"
             if extra in (expandable, expanded):
                 check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"', 'Button "open-send"', 'Button "expand-review"')
@@ -247,15 +309,15 @@ def main():
                 assert ':disabled[Bool(true)]' in checkbox, "Cached Viewed state is read-only until revalidated"
                 resolve = next(line for line in lines if 'Button "status-synthetic-thread"' in line)
                 assert ':disabled[Bool(true)]' in resolve, "Cached discussions cannot be mutated before revalidation"
-                assert "WARN" not in result.stderr, result.stderr
-                print(result.stderr.strip())
+                assert "WARN" not in warnings(result.stderr), result.stderr
+                print(warnings(result.stderr).strip())
                 continue
             if extra == sending:
                 # The exact text to paste, agent choice, and a Send that waits for a ready agent.
                 assert ':id[Str("review-send")]' in spec and 'Button "send-to-agent"' in spec, "Send view shows its preview and Send"
                 assert "thread synthetic-thread" in spec and "Synthetic fixture: why change this value?" in spec, "The preview is the exact message"
-                assert "WARN" not in result.stderr, result.stderr
-                print(result.stderr.strip())
+                assert "WARN" not in warnings(result.stderr), result.stderr
+                print(warnings(result.stderr).strip())
                 continue
             if not extra:
                 assert 'Button "show-history"' in spec, "Hidden history has an explicit recovery path"
@@ -276,8 +338,8 @@ def main():
                     assert '"Delete discussions"' in spec and '"Cancel"' in spec and 'Drafts and viewed marks are kept.' in spec
                 if extra == uncertain:
                     assert '"Retry clear"' in spec and 'not to delete newer discussions' in spec
-                assert "WARN" not in result.stderr, result.stderr
-                print(result.stderr.strip())
+                assert "WARN" not in warnings(result.stderr), result.stderr
+                print(warnings(result.stderr).strip())
                 continue
             assert ('Checkbox "file-viewed"' in spec) == (pending == "null"), "Loaded changed files offer an explicit Viewed checkbox"
             assert 'Button "hide-viewed"' in spec, "The file list offers a reversible viewed filter"
@@ -300,16 +362,76 @@ def main():
             assert dimmed == (pending != "null"), "A pending file switch must keep the shown diff, dimmed"
             assert ("icons/plus.svg" in spec) == (extra == hover), "Only a hovered, anchorable row shows the comment button"
             assert ('"Comment on lines 1–2"' in spec) == (extra == hover), "A range comment names its lines"
-            assert '"Ask for a short reply"' in spec, "Every open composer offers a short-reply request"
+            assert '"Reply in thread"' in spec, "Every open composer can ask for a reply in the thread"
             assert ("edit-synthetic-human" in spec) == (extra not in (editing, deleting)) and "edit-synthetic-agent" not in spec, "Only your own messages offer Edit"
             assert ('"Awaiting reply"' in spec) == (extra in (docked, inside, crowded)), "A thread owed a reply says so"
             # Resolve carries a check mark; a checked reply request adds one more.
             assert spec.count("icons/check.svg") == 1 + (extra == docked) + (2 if extra == viewed else 1 if extra == hidden else 0), "Resolve and a checked request show a check mark"
             if not extra:
                 assert all(f"icons/{name}.svg" in spec for name in ("reply", "pencil", "trash")), "Reply, Edit and Delete show their icons"
-            assert "WARN" not in result.stderr, result.stderr
-            print(result.stderr.strip())
-        print("Review full-height, stacked, pending-switch, hover/range, reply-request and discussions contracts passed (description only; not paint)")
+            assert "WARN" not in warnings(result.stderr), result.stderr
+            print(warnings(result.stderr).strip())
+        # Walkthroughs: the pane an agent opens, and Review's list of them.
+        walk = WALK
+        scenes = {
+            "wide": walk,
+            "narrow": walk + 'this.width = 368; this.height = 900;',
+            "reply": walk + 'this.intent = {id:"synthetic-step-draft", path:"src/example.py", anchor:this.threads[1].anchor, threadId:"synthetic-step-thread-1", walkthroughId:"synthetic-walkthrough", snapshotId:null, context:this.context()}; this.composer.set_value("Synthetic reply");',
+            "stale": walk + 'this.step = 2;',
+            "intro": walk + 'this.step = 0;',
+            "delete": walk + 'this.walkthroughConfirm = "synthetic-walkthrough";',
+            "send": walk + 'this.mode = "send";',
+            "loading": walk + 'this.walkthrough = null; this.threads = []; this.reading = true;',
+            "list": SUMMARY + ' this.mode = "walkthroughs"; this.width = 368; this.height = 900;',
+            "listed": SUMMARY,
+        }
+        for name, extra in scenes.items():
+            (destination / "main.js").write_text(FIXTURE.replace("PENDING", "null").replace("EXTRA", extra))
+            result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"], check=True, capture_output=True, text=True)
+            spec = result.stdout
+            assert "WARN" not in warnings(result.stderr), result.stderr
+            walking = name not in ("list", "listed")
+            assert (':id[Str("walkthrough-controls")]' in spec) == walking and (':id[Str("review-controls")]' in spec) != walking, f"{name}: a walkthrough replaces Review's toolbar"
+            if not walking:
+                toggle = next(i for i, line in enumerate(spec.splitlines()) if 'Button "toggle-walkthroughs"' in line)
+                assert ('"1"' in "\n".join(spec.splitlines()[toggle:toggle + 6])) == (name == "listed"), "Review offers its open walkthroughs, counted when there is room"
+                assert (':id[Str("review-walkthroughs")]' in spec) == (name == "list"), "The list replaces the files and diff"
+                if name == "list":
+                    assert 'Button "walkthrough-synthetic-walkthrough"' in spec and '"Archived"' in spec and '"Awaiting reply"' in spec, "Each walkthrough opens; archived ones stay listed"
+                    assert spec.index("How retries became safe") < spec.index("Old queue notes"), "Open walkthroughs come before archived ones"
+                continue
+            assert 'Button "walkthrough-back"' in spec and "icons/arrow-left.svg" in spec, f"{name}: Back returns to Review"
+            assert 'Button "scope-uncommitted"' not in spec and 'Button "choose-checkout"' not in spec, f"{name}: Review's scope and folder controls are hidden"
+            if name == "loading":
+                assert '"Loading walkthrough…"' in spec, "A walkthrough loads before it shows"
+                continue
+            if name == "send":
+                assert ':id[Str("review-send")]' in spec and 'Walkthrough \\"How retries became safe\\", step 2 of 3' in spec, "Send names the walkthrough step"
+                assert "is not repeated above" in spec and "what if the payload has no ID?" in spec, "Send pastes the replies, not the agent's own step"
+                continue
+            check_walkthrough_height(spec, stacked=name == "narrow")
+            assert all(f'Button "walkthrough-step-{i}"' in spec for i in range(3)), f"{name}: every step is in the outline"
+            assert 'walkthrough-summary-synthetic-walkthrough' in spec, f"{name}: the summary renders as Markdown"
+            step = {"stale": 2, "intro": 0}.get(name, 1)
+            assert f'"Step {step + 1} of 3"' in spec and f'walkthrough-body-synthetic-step-body-{step}' in spec, f"{name}: the shown step and its Markdown body"
+            assert (':disabled[Bool(true)]' in next(line for line in spec.splitlines() if 'Button "walkthrough-previous"' in line)) == (step == 0), "Previous stops at the first step"
+            assert (':disabled[Bool(true)]' in next(line for line in spec.splitlines() if 'Button "walkthrough-next"' in line)) == (step == 2), "Next stops at the last step"
+            assert (':id[Str("walkthrough-excerpt-' in spec) == (step != 0), f"{name}: only a step with a view shows code"
+            if step == 1:
+                assert 'new_value = 2' in spec and 'old_value = 1' in spec and '"Line 1"' in spec, "A diff step shows the replaced lines and names its range"
+                assert "icons/plus.svg" not in spec, "Frozen rows take no new comments"
+                assert 'step-synthetic-step-reply' in spec and 'Button "step-edit-synthetic-step-reply"' in spec, "Your reply can be edited"
+                assert 'step-edit-synthetic-step-body-1' not in spec and 'step-delete-synthetic-step-body-1' not in spec, "The agent's step cannot be changed here"
+                assert 'Button "open-send"' in spec, "An unsent reply offers Send"
+            if step == 2:
+                assert '"New version · lines 10–12"' in spec and '"⋯ line 12"' in spec, "A source step names its version and marks gaps"
+                assert '"Code changed since"' in spec and "lines as they were" in spec, "A stale step says the code changed"
+            if step == 0:
+                assert "No replies yet" in spec, "An empty discussion says how to start one"
+            assert ('"Reply · step 2"' in spec and '"Reply in thread"' in spec) == (name == "reply"), "A step reply uses Review's composer"
+            assert ('Button "step-reply-synthetic-step-thread-1"' in spec) == (name not in ("reply", "stale", "intro")), "Reply hides while its composer is open"
+            assert ('Button "walkthrough-confirm-delete"' in spec) == (name == "delete"), "Deleting a walkthrough asks first"
+        print("Review full-height, stacked, pending-switch, hover/range, reply-request, discussions and walkthrough contracts passed (description only; not paint)")
 
 
 if __name__ == "__main__":

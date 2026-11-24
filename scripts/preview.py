@@ -102,7 +102,7 @@ def main():
     action.add_argument("--crop", type=Path, metavar="WINDOW_SHOT", help="save only the specified sanitized UI rectangle")
     action.add_argument("--compose", action="store_true", help="rebuild preview.png from the kept native screenshot")
     parser.add_argument("--rect", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
-    parser.add_argument("--scene", choices=["commit", "history-branch", "history-branches", "history-edit-base", "history-go-commit", "pr", "pr-description", "pr-long-description", "no-pr"], default="commit", help="synthetic comparison to show")
+    parser.add_argument("--scene", choices=["commit", "history-branch", "history-branches", "history-edit-base", "history-go-commit", "pr", "pr-description", "pr-long-description", "no-pr", "walkthrough"], default="commit", help="synthetic comparison to show")
     parser.add_argument("--width", type=int, default=900, help="native demo width in logical pixels")
     parser.add_argument("--height", type=int, default=620, help="native demo height in logical pixels")
     args = parser.parse_args()

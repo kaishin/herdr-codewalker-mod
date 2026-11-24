@@ -624,7 +624,7 @@ class BackendTests(unittest.TestCase):
         created = self.cli("create", data={**data, "replyRequested": True})["thread"]
         self.assertTrue(created["messages"][0]["replyRequested"])
         self.assertTrue(created["awaitingReply"])
-        self.assertIn("short reply requested", self.cli("export")["text"])
+        self.assertIn("reply in thread required", self.cli("export")["text"])
         answered = self.cli("reply", data={"commandId": "answer", "expectedRevision": 1, "actor": AGENT,
                                            "threadId": created["id"], "body": "It matches the header."})["thread"]
         self.assertFalse(answered["messages"][1]["replyRequested"])
@@ -682,7 +682,7 @@ class BackendTests(unittest.TestCase):
                 self.assertIsNone(thread["messages"][0]["editedAt"])
                 self.assertFalse(thread["awaitingReply"])
                 with sqlite3.connect(self.store) as db:
-                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
                 # The migrated store takes edits.
                 message = thread["messages"][0]["id"]
                 self.cli("edit", data={"commandId": f"edit-v{version}", "expectedRevision": 1, "actor": HUMAN, "messageId": message, "body": "Edited"})
@@ -750,6 +750,200 @@ class BackendTests(unittest.TestCase):
         with sqlite3.connect(self.store) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 99)
 
+
+    # Walkthroughs ---------------------------------------------------------
+
+    def walkthrough_fixture(self):
+        """b.py: lines 4-5 replaced and one line added after line 16, so the diff has two hunks."""
+        (self.root / "b.py").write_text("".join(f"line {n}\n" for n in range(1, 21)), encoding="utf-8")
+        self.git("add", "b.py")
+        self.git("commit", "-qm", "b")
+        lines = [f"line {n}" for n in range(1, 21)]
+        lines[3:5] = ["LINE 4", "LINE 5"]
+        lines.insert(16, "added")
+        (self.root / "b.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return self.cli("review")
+
+    def walk(self, review, steps, command="walk1", actor=AGENT, **extra):
+        data = {"commandId": command, "expectedRevision": review["context"]["revision"], "actor": actor,
+                "scope": review["scope"], "snapshotId": review["snapshotId"], "title": "How b.py changed",
+                "summary": "Two edits.", "steps": steps, **extra}
+        return data
+
+    STEPS = [
+        {"title": "Intro", "body": "Read this **first**.", "view": None},
+        {"title": "Rename", "body": "Upper case.", "view": {"kind": "diff", "path": "b.py", "side": "new", "startLine": 4, "endLine": 5}},
+        {"title": "Caller", "body": "Unchanged context.", "view": {"kind": "source", "path": "a.txt", "rev": "head", "startLine": 1, "endLine": 2}},
+        {"title": "Whole file", "body": "All of it.", "view": {"kind": "diff", "path": "b.py"}},
+    ]
+
+    def test_walkthrough_freezes_rows_and_marks_steps_stale_when_code_changes(self):
+        review = self.walkthrough_fixture()
+        created = self.cli("walkthrough-create", data=self.walk(review, self.STEPS))
+        walkthrough = created["walkthrough"]
+        self.assertEqual(created["revision"], 1)
+        self.assertEqual([s["title"] for s in walkthrough["steps"]], ["Intro", "Rename", "Caller", "Whole file"])
+        self.assertEqual([s["position"] for s in walkthrough["steps"]], [0, 1, 2, 3])
+        self.assertEqual(walkthrough["validity"], "current")
+        self.assertEqual(walkthrough["comparison"], {"scope": "uncommitted", "baseRef": "HEAD"})
+        intro, rename, caller, whole = walkthrough["steps"]
+        self.assertIsNone(intro["view"])
+        # The step body is the first message of the step's thread.
+        self.assertEqual(intro["thread"]["messages"][0]["body"], "Read this **first**.")
+        self.assertEqual(intro["thread"]["messages"][0]["actor"], AGENT)
+        self.assertEqual(intro["thread"]["walkthrough"]["position"], 0)
+        self.assertEqual(intro["thread"]["walkthrough"]["stepCount"], 4)
+        # A new-side range keeps the removed lines it replaces.
+        self.assertEqual([(r["kind"], r["oldLine"], r["newLine"], r["text"]) for r in rename["view"]["hunks"][0]["rows"]],
+                         [("delete", 4, None, "line 4"), ("delete", 5, None, "line 5"), ("add", None, 4, "LINE 4"), ("add", None, 5, "LINE 5")])
+        self.assertEqual([(r["newLine"], r["text"]) for r in caller["view"]["hunks"][0]["rows"]], [(1, "one"), (2, "two")])
+        self.assertEqual(len(whole["view"]["hunks"]), 2)
+        # Step threads stay out of Review's discussions; the summary is listed.
+        listing = self.cli("list")
+        self.assertEqual(listing["threads"], [])
+        self.assertEqual([(w["id"], w["stepCount"], w["replies"]) for w in listing["walkthroughs"]], [(walkthrough["id"], 4, 0)])
+        self.assertEqual(self.cli("review")["walkthroughs"][0]["id"], walkthrough["id"])
+        self.assertIn('Walkthrough "How b.py changed"', self.cli("export")["text"])
+        # Code changes: the excerpt stays as it was; only the changed file's steps are stale.
+        (self.root / "b.py").write_text("rewritten\n", encoding="utf-8")
+        full = self.cli("walkthrough", "--walkthrough", walkthrough["id"])
+        # The pane watches this store and restores unsent step replies from drafts.
+        self.assertEqual((full["context"]["storePath"], full["drafts"]), (str(self.store.resolve()), []))
+        read = full["walkthrough"]
+        self.assertEqual([s["validity"] for s in read["steps"]], ["current", "stale", "current", "stale"])
+        self.assertEqual(read["steps"][1]["view"], rename["view"])
+        self.assertEqual(read["validity"], "stale")
+        (self.root / "a.txt").write_text("changed\n", encoding="utf-8")
+        read = self.cli("walkthrough", "--walkthrough", walkthrough["id"])["walkthrough"]
+        self.assertEqual(read["steps"][2]["validity"], "stale")
+        self.cli("walkthrough", "--walkthrough", "walkthrough_missing", error="not_found")
+        self.cli("walkthrough", error="invalid_request")
+
+    def test_walkthrough_create_checks_every_step_and_writes_nothing_on_failure(self):
+        review = self.walkthrough_fixture()
+        bad = [dict(self.STEPS[0]), {"title": "Wrong", "body": "x", "view": {"kind": "diff", "path": "b.py", "side": "new", "startLine": 2, "endLine": 9}}]
+        failed = self.cli("walkthrough-create", data=self.walk(review, bad), error="invalid_request")
+        self.assertEqual(failed["error"]["details"]["step"], 1)
+        self.cli("walkthrough-create", data=self.walk(review, self.STEPS, command="h", actor=HUMAN), error="invalid_request")
+        self.cli("walkthrough-create", data=self.walk(review, [{"title": "t", "body": "b", "view": {"kind": "diff", "path": "a.txt"}}], command="n"), error="not_found")
+        self.cli("walkthrough-create", data=self.walk(review, [{"title": "t", "body": "b", "view": {"kind": "source", "path": "a.txt", "rev": "base", "startLine": 1, "endLine": 9}}], command="p"), error="invalid_request")
+        self.cli("walkthrough-create", data=self.walk(review, [{"title": "t", "body": "b", "rows": []}], command="r"), error="invalid_request")
+        self.cli("walkthrough-create", data=self.walk(review, [], command="e"), error="invalid_request")
+        self.cli("walkthrough-create", data=self.walk(review, self.STEPS, command="s", snapshotId="snapshot_old"), error="snapshot_conflict")
+        state = self.cli("walkthroughs")
+        self.assertEqual((state["revision"], state["walkthroughs"]), (0, []))
+        with sqlite3.connect(self.store) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM threads").fetchone()[0], 0)
+
+    def test_walkthrough_steps_take_replies_and_keep_their_first_message(self):
+        review = self.walkthrough_fixture()
+        walkthrough = self.cli("walkthrough-create", data=self.walk(review, self.STEPS))["walkthrough"]
+        thread = walkthrough["steps"][1]["thread"]
+        asked = self.cli("reply", data={"commandId": "ask", "expectedRevision": 1, "actor": HUMAN, "threadId": thread["id"],
+                                        "body": "Why upper case?", "replyRequested": True})["thread"]
+        self.assertTrue(asked["awaitingReply"])
+        self.assertEqual(asked["anchor"]["validity"], "current")
+        self.assertEqual(asked["walkthrough"]["stepId"], walkthrough["steps"][1]["id"])
+        summary = self.cli("walkthroughs")["walkthroughs"][0]
+        self.assertEqual((summary["awaitingReply"], summary["replies"]), (1, 1))
+        self.cli("reply", data={"commandId": "answer", "expectedRevision": 2, "actor": AGENT, "threadId": thread["id"], "body": "It is a constant."})
+        self.assertEqual(self.cli("walkthroughs")["walkthroughs"][0]["awaitingReply"], 0)
+        first = thread["messages"][0]["id"]
+        self.cli("delete", data={"commandId": "del", "expectedRevision": 3, "actor": AGENT, "messageId": first}, error="invalid_request")
+        edited = self.cli("edit", data={"commandId": "edit", "expectedRevision": 3, "actor": AGENT, "messageId": first, "body": "Constants are upper case."})
+        self.assertEqual(edited["thread"]["messages"][0]["body"], "Constants are upper case.")
+        self.cli("resolve", data={"commandId": "res", "expectedRevision": 4, "actor": HUMAN, "threadId": thread["id"], "resolved": True})
+        # Clearing Review's history keeps walkthroughs: they have their own delete.
+        self.create(command="note")
+        cleared = self.cli("history-clear", data={"commandId": "clear", "expectedRevision": 6, "actor": HUMAN, "confirmed": True})
+        self.assertEqual(cleared["cleared"], {"threads": 1})
+        kept = self.cli("walkthrough", "--walkthrough", walkthrough["id"])["walkthrough"]
+        self.assertEqual(len(kept["steps"]), 4)
+        self.assertEqual(kept["steps"][1]["thread"]["status"], "resolved")
+
+    def test_walkthrough_append_update_and_delete_follow_authorship(self):
+        review = self.walkthrough_fixture()
+        walkthrough = self.cli("walkthrough-create", data=self.walk(review, self.STEPS[:2]))["walkthrough"]
+        wid, first = walkthrough["id"], walkthrough["steps"][0]["id"]
+        base = {"expectedRevision": 1, "walkthroughId": wid}
+        extra = [{"title": "Added", "body": "Inserted.", "view": {"kind": "diff", "path": "b.py", "side": "new", "startLine": 17, "endLine": 17}}]
+        append = {**base, "commandId": "app", "actor": AGENT, "snapshotId": review["snapshotId"], "afterStepId": first, "steps": extra}
+        self.cli("walkthrough-append", data={**append, "commandId": "other", "actor": {**AGENT, "id": "other"}}, error="invalid_request")
+        self.cli("walkthrough-append", data={**append, "commandId": "miss", "afterStepId": "step_missing"}, error="not_found")
+        appended = self.cli("walkthrough-append", data=dict(append))
+        self.assertEqual([s["title"] for s in appended["walkthrough"]["steps"]], ["Intro", "Added", "Rename"])
+        self.assertEqual([s["position"] for s in appended["walkthrough"]["steps"]], [0, 1, 2])
+        self.assertEqual(appended["walkthrough"]["steps"][1]["view"]["hunks"][0]["rows"][0]["text"], "added")
+        # A retry of the same command returns the first result and writes nothing.
+        self.assertEqual(self.cli("walkthrough-append", data=dict(append)), appended)
+        update = {**base, "expectedRevision": 2, "commandId": "up", "actor": HUMAN, "title": "Mine"}
+        self.cli("walkthrough-update", data=dict(update), error="invalid_request")
+        archived = self.cli("walkthrough-update", data={**base, "expectedRevision": 2, "commandId": "arch", "actor": HUMAN, "status": "archived"})
+        self.assertEqual(archived["walkthrough"]["status"], "archived")
+        renamed = self.cli("walkthrough-update", data={**base, "expectedRevision": 3, "commandId": "ren", "actor": AGENT, "title": "Renamed"})
+        self.assertEqual(renamed["walkthrough"]["title"], "Renamed")
+        delete = {**base, "expectedRevision": 4, "commandId": "del", "actor": HUMAN}
+        self.cli("walkthrough-delete", data=dict(delete), error="invalid_request")
+        deleted = self.cli("walkthrough-delete", data={**delete, "commandId": "del2", "confirmed": True})
+        self.assertEqual(deleted["deleted"], {"walkthroughId": wid, "steps": 3})
+        self.assertEqual(self.cli("walkthroughs")["walkthroughs"], [])
+        with sqlite3.connect(self.store) as db:
+            for table in ("threads", "messages", "walkthrough_steps", "walkthroughs"):
+                self.assertEqual(db.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0, table)
+
+    def test_walkthrough_pins_a_commit_and_its_source_steps_never_go_stale(self):
+        self.walkthrough_fixture()
+        self.git("commit", "-qam", "upper")
+        review = self.cli("review", "--scope", "commit", "--commit", "HEAD")
+        steps = [self.STEPS[1], {"title": "Before", "body": "Old.", "view": {"kind": "source", "path": "b.py", "rev": "base", "startLine": 4, "endLine": 4}}]
+        walkthrough = self.cli("walkthrough-create", data=self.walk(review, steps, commit=review["commitOid"]))["walkthrough"]
+        self.assertEqual(walkthrough["comparison"]["commitOid"], review["commitOid"])
+        self.assertEqual(walkthrough["steps"][1]["view"]["hunks"][0]["rows"][0]["text"], "line 4")
+        (self.root / "b.py").write_text("worktree edits do not matter\n", encoding="utf-8")
+        self.git("commit", "-qam", "later")
+        read = self.cli("walkthrough", "--walkthrough", walkthrough["id"])["walkthrough"]
+        self.assertEqual([s["validity"] for s in read["steps"]], ["current", "current"])
+
+    def test_open_walkthrough_checks_it_exists_before_opening_a_pane(self):
+        review = self.walkthrough_fixture()
+        wid = self.cli("walkthrough-create", data=self.walk(review, self.STEPS))["walkthrough"]["id"]
+        tool_dir = Path(self.temp.name) / "bin"
+        tool_dir.mkdir()
+        calls = Path(self.temp.name) / "calls.jsonl"
+        app = tool_dir / "herdr-app"
+        app.write_text(f"#!{sys.executable}\n" + "import json,sys\n"
+            + f"with open({str(calls)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "print(json.dumps({'spaces':[{'tabs':[{'terminals':[{'terminal':'t-source','pane':'p-source'}]}]}]} if sys.argv[1] == 'ls' else {'pane':'p-created'}))\n")
+        app.chmod(0o755)
+        env = {**os.environ, "PATH": str(tool_dir) + os.pathsep + os.environ.get("PATH", ""), "HC_TERMINAL_ID": "t-source"}
+        argv = [sys.executable, str(HELPER), "--store", str(self.store), "open", "--repo", str(self.root), "--walkthrough", wid]
+        result = json.loads(subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30).stdout)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"], {"pane": "p-created", "folder": str(self.root.resolve()), "walkthroughId": wid, "scope": "uncommitted"})
+        split = json.loads([json.loads(line) for line in calls.read_text().splitlines()][1][2])
+        self.assertEqual(split["props"], {"framed": True, "folder": str(self.root.resolve()), "walkthrough": wid})
+        calls.write_text("")
+        argv[-1] = "walkthrough_missing"
+        self.assertEqual(json.loads(subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30).stdout)["error"]["code"], "not_found")
+        self.assertEqual(calls.read_text(), "", "a missing walkthrough cannot open a pane")
+
+    def test_walkthrough_skill_recipe_creates_a_walkthrough_as_printed(self):
+        self.walkthrough_fixture()
+        text = subprocess.run([sys.executable, str(HELPER), "skill", "--topic", "walkthrough", "--repo", str(self.root)],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertIn("walkthrough-create", text)
+        recipe = text.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        recipe = (recipe.replace('"--repo", ', f'"--store", {str(self.store)!r}, "--repo", ', 1)
+                  .replace('"<your agent name>"', '"Test agent"', 1).replace('"<path>"', '"b.py"', 1)
+                  .replace('"startLine": 1, "endLine": 10', '"startLine": 4, "endLine": 5', 1))
+        result = json.loads(subprocess.run([sys.executable, "-c", recipe], capture_output=True, text=True, check=True).stdout)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(result["steps"]), 2)
+        read = self.cli("walkthrough", "--walkthrough", result["walkthroughId"])["walkthrough"]
+        self.assertEqual(read["author"]["name"], "Test agent")
+        hello = json.loads(subprocess.run([sys.executable, str(HELPER), "hello", "--json"], capture_output=True, text=True).stdout)["data"]
+        self.assertIn("walkthroughs", hello["capabilities"])
+        self.assertEqual(hello["helperVersion"], 3)
 
 if __name__ == "__main__":
     unittest.main()

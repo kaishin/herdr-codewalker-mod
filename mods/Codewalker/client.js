@@ -43,7 +43,7 @@ function normalizeThread(thread) {
 
 function normalizeDraft(draft) {
   const target = draft.target ?? {};
-  return { ...draft, path: target.path ?? target.anchor?.path ?? "Saved discussion", intent: { id: draft.id, path: target.path ?? target.anchor?.path, anchor: target.anchor, threadId: target.threadId ?? null, snapshotId: target.snapshotId ?? target.anchor?.snapshotId, context: target.context, pendingPost: target.pendingPost, replyRequested: target.replyRequested === true } };
+  return { ...draft, path: target.path ?? target.anchor?.path ?? "Saved discussion", intent: { id: draft.id, path: target.path ?? target.anchor?.path, anchor: target.anchor, threadId: target.threadId ?? null, walkthroughId: target.walkthroughId ?? null, snapshotId: target.snapshotId ?? target.anchor?.snapshotId, context: target.context, pendingPost: target.pendingPost, replyRequested: target.replyRequested === true } };
 }
 
 const RETAINED = "This path is no longer in the selected diff. Its discussions are retained below.";
@@ -152,7 +152,7 @@ export class ReviewClient {
   }
 
   async call(context, command, args = []) {
-    const write = !["review", "list", "context", "export"].includes(command);
+    const write = !["review", "list", "context", "export", "walkthrough", "walkthroughs"].includes(command);
     // Lets the view ignore store-folder events caused by its own writes, before and after they land.
     if (write) this.lastWrite = Date.now();
     try { return await this.invoke(context, command, args); }
@@ -231,6 +231,8 @@ export class ReviewClient {
       branch: data.context.branch, storePath: data.context.storePath, snapshotId: data.snapshotId, baseRef: data.baseRef, baseOid: data.baseOid, commitOid: data.commitOid, parentCount: data.parentCount,
       files: data.files.map(file => ({ ...file, status: STATUS[file.status] ?? file.status })),
       threads: data.threads.map(normalizeThread), drafts: humanDrafts(data.drafts), note: data.warnings?.join(" · "), detail,
+      // Older helpers have no walkthroughs.
+      walkthroughs: data.walkthroughs ?? [],
     };
   }
 
@@ -258,7 +260,7 @@ export class ReviewClient {
   }
 
   saveDraft(context, intent, body) {
-    return this.mutation(context, "draft-save", { draftId: intent.id, body, target: { path: intent.path, anchor: intent.anchor, threadId: intent.threadId, snapshotId: intent.snapshotId, context: intent.context ?? context, pendingPost: this.attempts.get(intent.id) ?? intent.pendingPost, replyRequested: intent.replyRequested === true, scope: context.source, base: context.baseRef, commit: context.commitRef } });
+    return this.mutation(context, "draft-save", { draftId: intent.id, body, target: { path: intent.path, anchor: intent.anchor, threadId: intent.threadId, walkthroughId: intent.walkthroughId ?? undefined, snapshotId: intent.snapshotId, context: intent.context ?? context, pendingPost: this.attempts.get(intent.id) ?? intent.pendingPost, replyRequested: intent.replyRequested === true, scope: context.source, base: context.baseRef, commit: context.commitRef } });
   }
 
   deleteDraft(context, draftId) {
@@ -283,7 +285,7 @@ export class ReviewClient {
         const receipt = { commandId, context, operation: command, payload };
         // Persist the exact post envelope BEFORE invoking it. The draft commit advances revision by one.
         const draft = { commandId: newId(), reviewId: context.reviewId, expectedRevision: revision, actor: HUMAN, draftId: intent.id, body,
-          target: { path: intent.path, anchor: intent.anchor, threadId: intent.threadId, snapshotId: intent.snapshotId, context: intent.context ?? context, pendingPost: receipt, replyRequested: intent.replyRequested === true } };
+          target: { path: intent.path, anchor: intent.anchor, threadId: intent.threadId, walkthroughId: intent.walkthroughId ?? undefined, snapshotId: intent.snapshotId, context: intent.context ?? context, pendingPost: receipt, replyRequested: intent.replyRequested === true } };
         await this.call(context, "draft-save", await this.dataArgs(context, JSON.stringify(draft)));
         this.attempts.set(intent.id, receipt);
         entry = { command, payload };
@@ -319,6 +321,32 @@ export class ReviewClient {
   setFileViewed(context, path, diffFingerprint, viewed, commandId) {
     return this.mutation(context, "file-view", { scope: context.source,
       ...(["branch", "pr"].includes(context.source) ? { base: context.baseRef } : {}), ...(["commit", "pr"].includes(context.source) ? { commit: context.commitRef } : {}), path, diffFingerprint, viewed }, commandId);
+  }
+
+  // Walkthroughs need a helper with the "walkthroughs" capability on another machine.
+  async requireWalkthroughs(context) {
+    const helper = await this.helperFor(context);
+    if (helper.machine && !helper.capabilities.includes("walkthroughs")) throw protocolError({ code: "remote_helper_outdated",
+      message: `The helper on ${helper.machine} cannot show walkthroughs. Update it manually: ${this.installCommand(helper.machine)}` });
+  }
+
+  // One walkthrough with its steps, frozen rows and step threads. A read: not queued behind writes.
+  async walkthrough(context, id) {
+    await this.requireWalkthroughs(context);
+    const data = await this.call(context, "walkthrough", ["--walkthrough", id]);
+    const walkthrough = { ...data.walkthrough, steps: data.walkthrough.steps.map(step => ({ ...step, thread: normalizeThread(step.thread) })) };
+    return { machine: data.machine, root: data.context.repoRoot, reviewId: data.reviewId, revision: data.revision, branch: data.context.branch,
+      storePath: data.context.storePath, walkthrough, drafts: humanDrafts(data.drafts).filter(draft => draft.intent.walkthroughId === id) };
+  }
+
+  // Open or archived. Archiving hides nothing from the agent; it only sorts the list.
+  setWalkthroughStatus(context, walkthroughId, status, commandId) {
+    return this.mutation(context, "walkthrough-update", { walkthroughId, status }, commandId);
+  }
+
+  // A person who did not write it must confirm. Steps and every reply go with it.
+  deleteWalkthrough(context, walkthroughId, commandId) {
+    return this.mutation(context, "walkthrough-delete", { walkthroughId, confirmed: true }, commandId);
   }
 
   setStatus(context, threadId, status, commandId) {

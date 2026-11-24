@@ -21,6 +21,9 @@ export default class Preview extends Codewalker {
   markArrived() {}
   changeRoot() {}
   applySource() {}
+  readWalkthrough() {}
+  setWalkthroughStatus() {}
+  deleteWalkthrough() {}
   candidates() { return []; }
 
   init(p, cx) {
@@ -94,6 +97,36 @@ export default class Preview extends Codewalker {
     if (scene === "history-branches") this.history.picking = true;
     if (scene === "history-edit-base") { this.source = "branch"; this.history.entry = "base"; }
     if (scene === "history-go-commit") this.history.entry = "commit";
+    if (scene === "walkthrough") {
+      // An agent's tour of the same change: one intro, one diff step, one unchanged caller.
+      const agent = { kind: "agent", id: "demo", name: "Agent" }, you = { kind: "human", id: "local", name: "You" };
+      const id = "demo-walkthrough", titles = ["Why retries were unsafe", "Insert once per job ID", "Where retries come from"];
+      const thread = (n, messages, extra = {}) => ({ id: `demo-step-thread-${n}`, path: [null, this.file, "src/jobs/worker.ts"][n], status: "open", awaitingReply: false, outdated: false,
+        anchor: { walkthroughId: id, stepId: `demo-step-${n}`, validity: "current" },
+        walkthrough: { id, title: "Safe job retries", stepId: `demo-step-${n}`, position: n, stepTitle: titles[n], stepCount: 3 }, messages, ...extra });
+      const steps = [
+        { view: null, body: "Two workers can receive the same job after a timeout. Both insert it, so the job runs **twice**.\n\nThis walkthrough shows the one-line fix and the caller that retries." },
+        { view: { kind: "diff", path: this.file, oldPath: null, status: "modified", side: "new", startLine: 13, endLine: 15, hunks: [{ rows: [
+            { kind: "delete", oldLine: 13, newLine: null, text: "  await db.insert(jobs).values(job);" },
+            { kind: "add", oldLine: null, newLine: 13, text: "  await db.insert(jobs)" },
+            { kind: "add", oldLine: null, newLine: 14, text: "    .values(job)" },
+            { kind: "add", oldLine: null, newLine: 15, text: "    .onConflictDoNothing({ target: jobs.id });" }] }] },
+          body: "The insert now ignores a second row with the same `jobs.id`. The ID comes from the producer, so a retry reuses it.\n\n- No lock is needed.\n- The first insert wins." },
+        { view: { kind: "source", path: "src/jobs/worker.ts", rev: "head", startLine: 41, endLine: 44, hunks: [{ rows: [
+            { kind: "context", oldLine: null, newLine: 41, text: "} catch (error) {" },
+            { kind: "context", oldLine: null, newLine: 42, text: "  if (isTimeout(error)) return enqueue(job);" },
+            { kind: "context", oldLine: null, newLine: 43, text: "  throw error;" },
+            { kind: "context", oldLine: null, newLine: 44, text: "}" }] }] },
+          body: "The worker retries with the **same** job object. This file did not change; it is here so you can see where the duplicate came from." },
+      ].map((step, n) => ({ id: `demo-step-${n}`, position: n, title: titles[n], view: step.view, validity: "current",
+        thread: thread(n, [{ id: `demo-step-body-${n}`, actor: agent, body: step.body, createdAt: "2026-01-01T10:00:00Z" },
+          ...(n === 1 ? [{ id: "demo-step-question", actor: you, body: "What if the producer sends no ID?", createdAt: "2026-01-01T10:04:00Z", delivery: { state: "sent", target: "demo-agent" } },
+            { id: "demo-step-answer", actor: agent, body: "Then the schema rejects the job: `jobs.id` is required since the previous commit.", createdAt: "2026-01-01T10:05:00Z" }] : [])]) }));
+      this.walkthroughId = id;
+      this.walkthrough = { id, title: "Safe job retries", summary: "How the queue stops running a retried job twice.", status: "open", author: agent, createdAt: "2026-01-01T10:00:00Z", steps };
+      this.step = 1;
+      this.threads = steps.map(step => step.thread);
+    }
     if (["pr", "pr-description", "pr-long-description", "no-pr"].includes(scene)) {
       this.source = "pr";
       this.prTab = scene === "pr" ? "changes" : "description";

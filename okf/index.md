@@ -10,6 +10,7 @@ Project documentation migrated from `docs/` into Open Knowledge Format v0.2. His
 
 - [Agent workflow](/agent-workflow.md) - Use the shared CLI to read diffs, exchange review comments, and recover safely from conflicts.
 - [Codewalker local CLI protocol v1](/protocol.md) - JSON CLI contracts for review reads, durable mutations, storage, and remote execution.
+- [Agent-written code walkthroughs](/walkthroughs.md) - Ordered steps of frozen diff or source excerpts with Markdown, each step a reply thread. Backend implemented; UI pending.
 
 ## Native review
 

@@ -118,12 +118,12 @@ PY
 cw reply --data "$(cat "$WORK/reply.json")"
 ```
 
-### Short replies the reviewer asked for
+### Replies the reviewer wants in the thread
 
-When the reviewer checks **Ask for a short reply** on a comment, its thread has `awaitingReply: true` in `list`, and `export` marks it `short reply requested`. For each such thread:
+When the reviewer checks **Reply in thread** on a comment, its thread has `awaitingReply: true` in `list`, and `export` and Send mark it `reply in thread required`. Without it, an answer in chat is enough. For each such thread:
 
 1. Read the comment and the anchored code.
-2. Post one `reply` in that thread: a few sentences that answer the question or say what you will change. Do not start a long discussion in the review.
+2. Post a `reply` in that thread that answers the question or says what you will change, also when you answer in chat.
 3. Continue your work. The reply clears `awaitingReply`.
 
 ```sh
@@ -159,11 +159,15 @@ When asked, use `file-view` with the common mutation envelope and `{scope, base,
 
 ## Feedback the reviewer sends you
 
-**Send** in Review pastes a message into your terminal: one `###` section per discussion with its path, lines, thread ID, code and messages, then one command: `python3 <helper> skill --repo <checkout>`. It prints how to answer in a thread (rules and a reply/edit/delete recipe, with the paths filled in). `skill` needs no review and returns Markdown, not JSON. Act on the comments. Answer in the thread when it says `short reply requested` (a few sentences), then continue. The reviewer's later sends contain only new comments.
+**Send** in Review pastes a message into your terminal: one `###` section per discussion with its path, lines, thread ID, code and messages, then one command: `python3 <helper> skill --repo <checkout>`. It prints how to answer in a thread (rules and a reply/edit/delete recipe, with the paths filled in). `skill` needs no review and returns Markdown, not JSON. Act on the comments. Answer in the thread when it says `reply in thread required` (also when you answer in chat), then continue. The reviewer's later sends contain only new comments.
 
 ## Show Review to the reviewer
 
 `python3 "$CW" open` in a local Herdr terminal opens Review as a pane right of that terminal, for its folder (or `--repo`). Add `--scope commit --commit <SHA-or-ref>` to open a specific commit, or `--scope branch --base <ref>` for branch mode. The returned `pane` is the newly created pane. Other mods use `pane.split` with `props:{framed:true, folder, scope:"commit", commit}`; see the public props contract in [protocol.md](/protocol.md).
+
+## Write a walkthrough
+
+`python3 "$CW" skill --topic walkthrough --repo "$REPO"` prints a recipe: read the diff, write ordered steps (title, Markdown body, and a diff range, a file range or no code), create the walkthrough, and open it with `open --walkthrough <id>`. The reviewer replies in each step's thread; answer with `reply` as for other threads. See [Agent-written code walkthroughs](/walkthroughs.md).
 
 ## Conflicts and uncertain outcomes
 

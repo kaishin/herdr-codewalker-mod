@@ -426,7 +426,7 @@ test("a window opened for one space keeps it", async () => {
   assert.ok(view.intent);
 });
 
-test("Ask for a short reply travels with the draft and the post, and stays on for the next comment", async () => {
+test("Reply in thread travels with the draft and the post, and stays on for the next comment", async () => {
   const saved = [], posted = [];
   const { view, cx, drain } = await modules({ client: {
     saveDraft: async (_context, intent) => { saved.push(intent.replyRequested); return { reviewId: "review-a", revision: 2 }; },
@@ -840,7 +840,7 @@ test("a send records uncertain, runs plain hc send, then records sent and focuse
   assert.equal(args.length, 4);
   // hc send waits while a person types there (60 s or more): hc()'s fixed 30 s would cut it off.
   assert.equal(calls.options[0].timeout, 600000);
-  assert.match(args[3], /thread t1 · short reply requested/);
+  assert.match(args[3], /thread t1 · reply in thread required/);
   assert.match(args[3], /Why upper case\?/);
   assert.ok(!args.includes("--force") && !args.includes("--if"));
   assert.equal(JSON.stringify(calls.run), JSON.stringify([["pane.focus", { terminal: "t7" }]]));
@@ -969,7 +969,7 @@ test("only new comments in open threads are sent, also where the code changed; a
   assert.equal(model.uncertainCount(threads), 1);
   assert.equal(model.unconfirmedTargets(threads), "studio/t16d", "the banner names where the unconfirmed send went");
   const text = model.sendText({ items: model.sendable([threads[4]], { again: true }), root: "/my checkout", branch: "main", helper: "/app/it's/backend.py", note: " Fix first " });
-  assert.ok(!text.includes("short reply requested"), "no reply instruction unless asked");
+  assert.ok(!text.includes("reply in thread required"), "no reply instruction unless asked");
   assert.match(text, /\nFix first\n/);
   assert.match(model.sendText({ items: model.sendable([threads[2]]), root: "/r", helper: "/h" }), /· thread t3 · code changed since/);
   assert.match(text, /python3 '\/app\/it'\\''s\/backend\.py' skill --repo '\/my checkout'$/);
@@ -1845,4 +1845,157 @@ test("History ref editors are exclusive, cancel without navigating, and close on
   view.history.dismiss();
   assert.equal(view.history.picking, false);
   assert.equal(view.source, "commit", "Closing a picker does not change the displayed diff");
+});
+
+// Walkthroughs: an agent's ordered steps, each step a reply thread.
+const agentActor = { kind: "agent", id: "pi", name: "Pi" }, reviewer = { kind: "human", id: "local", name: "You" };
+function walkthroughFixture({ ids = ["s1", "s2", "s3"], replies = {} } = {}) {
+  const steps = ids.map((id, position) => ({ id, position, title: `Step ${id}`, validity: "current",
+    view: position ? { kind: "diff", path: "a.txt", side: "new", startLine: 1, endLine: 1, hunks: [{ rows: [{ kind: "add", oldLine: null, newLine: 1, text: "new" }] }] } : null,
+    thread: { id: `thread-${id}`, path: position ? "a.txt" : null, status: "open", awaitingReply: false, outdated: false,
+      anchor: { walkthroughId: "w1", stepId: id, validity: "current" },
+      walkthrough: { id: "w1", title: "Tour", stepId: id, position, stepTitle: `Step ${id}`, stepCount: ids.length },
+      messages: [{ id: `body-${id}`, actor: agentActor, body: `Body ${id}` }, ...(replies[id] ?? [])] } }));
+  return { id: "w1", title: "Tour", summary: "", status: "open", author: agentActor, steps };
+}
+const walkthroughRead = (fixture, extra = {}) => ({ machine: null, root: "/checkout", reviewId: "review-a", revision: 5, branch: "feature", storePath: null, walkthrough: fixture, drafts: [], ...extra });
+
+test("a walkthrough pane reads its steps, and their threads drive Send", async () => {
+  const fixture = walkthroughFixture({ replies: { s2: [{ id: "mine", actor: reviewer, body: "Why?", delivery: null }] } });
+  const { view, cx, drain } = await modules({ client: { walkthrough: async (_context, id) => { assert.equal(id, "w1"); return walkthroughRead(fixture); } } });
+  view.intent = null; view.composer.set_value("");
+  view.walkthroughId = "w1";
+  view.refresh(cx);
+  await drain();
+  assert.equal(view.walkthrough.title, "Tour");
+  assert.deepEqual(view.threads.map(thread => thread.id), ["thread-s1", "thread-s2", "thread-s3"]);
+  assert.equal(view.revision, 5);
+  const { load } = await modules();
+  const { sendable, sendText } = (await load(path.join(root, "mods/Codewalker/model.js"))).namespace;
+  const items = sendable(view.visibleThreads());
+  assert.deepEqual(items.map(item => item.thread.id), ["thread-s2"], "only the step with an unsent reply");
+  const text = sendText({ items, root: "/checkout", branch: "feature", helper: "/app/backend.py" });
+  assert.match(text, /### Walkthrough "Tour", step 2 of 3: Step s2 · thread thread-s2/);
+  assert.match(text, /walkthrough --walkthrough w1/);
+  assert.doesNotMatch(text, /Body s2/, "the agent's own step text is not pasted back");
+  assert.match(text, /Reviewer \(new\): Why\?/);
+  const two = sendText({ items: [...items, { thread: view.threads[2], messageIds: [] }], root: "/checkout", helper: "/app/backend.py" });
+  assert.equal(two.split("walkthrough --walkthrough w1").length - 1, 1, "the read command is given once per walkthrough, not per step");
+  assert.ok(two.indexOf("walkthrough --walkthrough w1") > two.lastIndexOf("### Walkthrough"), "after the steps, next to the skill line");
+});
+
+test("a refresh keeps the shown step when the agent inserts steps before it", async () => {
+  let fixture = walkthroughFixture();
+  const { view, cx, drain } = await modules({ client: { walkthrough: async () => walkthroughRead(fixture, { revision: fixture.steps.length + 4 }) } });
+  view.intent = null; view.composer.set_value("");
+  view.walkthroughId = "w1";
+  view.refresh(cx); await drain();
+  view.goStep(2, cx); await drain();
+  assert.equal(view.step, 2);
+  fixture = walkthroughFixture({ ids: ["s0", "s1", "s2", "s3"] });
+  view.refresh(cx, true); await drain();
+  assert.equal(view.walkthrough.steps[view.step].id, "s3");
+  view.goStep(99, cx);
+  assert.equal(view.step, 3, "no step past the end");
+});
+
+test("moving to another step saves the reply as a draft; Continue draft restores it there", async () => {
+  const saved = [];
+  let drafts = [];
+  const { view, cx, drain } = await modules({ client: {
+    walkthrough: async () => walkthroughRead(walkthroughFixture(), { drafts }),
+    saveDraft: async (context, intent, body) => { saved.push({ intent, body }); drafts = [{ id: intent.id, body, path: "a.txt", intent: { ...intent, walkthroughId: "w1" } }]; return { reviewId: "review-a", revision: 6 }; },
+  } });
+  view.intent = null; view.composer.set_value("");
+  view.walkthroughId = "w1";
+  view.refresh(cx); await drain();
+  view.goStep(1, cx); await drain();
+  const thread = view.stepThread(view.walkthrough.steps[1]);
+  view.beginStepReply(thread, cx); await drain();
+  assert.equal(view.intent.threadId, "thread-s2");
+  assert.equal(view.intent.walkthroughId, "w1", "the draft names its walkthrough, so Review does not list it");
+  view.composer.set_value("Half a question");
+  view.goStep(2, cx); await drain();
+  assert.equal(saved.at(-1).body, "Half a question");
+  assert.equal(view.intent, null);
+  assert.equal(view.step, 2);
+  assert.equal(view.drafts.length, 1, "the next read brings the saved draft back");
+  view.goStep(1, cx); await drain();
+  view.beginStepReply(thread, cx); await drain();
+  assert.equal(view.composer.value(), "Half a question");
+  assert.equal(view.intent.threadId, "thread-s2");
+});
+
+test("arrow keys never move steps while a reply is open", async () => {
+  const { view, cx, drain } = await modules({ client: { walkthrough: async () => walkthroughRead(walkthroughFixture()) } });
+  view.intent = null; view.composer.set_value("");
+  view.walkthroughId = "w1";
+  view.refresh(cx); await drain();
+  view.editing = { id: "mine", body: "Old", commandId: "c" };
+  view.editor.set_value("Changed");
+  view.goStep(1, cx); await drain();
+  assert.equal(view.step, 0, "an unsaved edit blocks the move");
+  assert.match(view.error, /Save or cancel/);
+});
+
+test("Back returns to Review's comparison and its walkthrough list; Review hides walkthrough reply drafts", async () => {
+  const reads = [];
+  const { view, cx, drain } = await modules({ client: {
+    walkthrough: async () => { reads.push("walkthrough"); return walkthroughRead(walkthroughFixture()); },
+    review: async () => { reads.push("review"); return { ...review(), walkthroughs: [{ id: "w1", title: "Tour", status: "open", stepCount: 3, replies: 0, awaitingReply: 0 }],
+      drafts: [{ id: "d-review", path: "a.txt", intent: { id: "d-review", path: "a.txt" } }, { id: "d-step", path: "Saved discussion", intent: { id: "d-step", threadId: "thread-s2", walkthroughId: "w1" } }] }; },
+  } });
+  view.intent = null; view.composer.set_value("");
+  view.draftsLoaded = false;
+  view.refresh(cx); await drain();
+  assert.equal(view.walkthroughs.length, 1);
+  assert.deepEqual(view.drafts.map(draft => draft.id), ["d-review"]);
+  view.openWalkthrough("w1", cx); await drain();
+  assert.equal(view.walkthroughId, "w1");
+  assert.equal(view.walkthrough.title, "Tour");
+  view.closeWalkthrough(cx); await drain();
+  assert.equal(view.walkthroughId, null);
+  assert.equal(view.mode, "walkthroughs");
+  assert.deepEqual(reads, ["review", "walkthrough", "review"]);
+  assert.equal(view.walkthroughs[0].id, "w1");
+});
+
+test("deleting a walkthrough asks first, deletes its reply drafts, then returns to Review", async () => {
+  const deleted = [], draftsGone = [];
+  const { view, cx, drain } = await modules({ client: {
+    walkthrough: async () => walkthroughRead(walkthroughFixture(), { drafts: [{ id: "d-step", body: "x", path: "a.txt", intent: { id: "d-step", threadId: "thread-s2", walkthroughId: "w1" } }] }),
+    deleteWalkthrough: async (_context, id) => { deleted.push(id); return { reviewId: "review-a", revision: 9 }; },
+    deleteDraft: async (_context, id) => { draftsGone.push(id); return { reviewId: "review-a", revision: 10 }; },
+  } });
+  view.intent = null; view.composer.set_value("");
+  view.draftsLoaded = false;
+  view.walkthroughId = "w1";
+  view.refresh(cx); await drain();
+  view.deleteWalkthrough(cx); await drain();
+  assert.deepEqual(deleted, [], "the first click only asks");
+  assert.equal(view.walkthroughConfirm, "w1");
+  view.deleteWalkthrough(cx); await drain();
+  assert.deepEqual(deleted, ["w1"]);
+  assert.deepEqual(draftsGone, ["d-step"]);
+  assert.equal(view.walkthroughId, null);
+});
+
+test("walkthrough rows keep gaps between hunks, and labels name the version", async () => {
+  const { load } = await modules();
+  const { excerptRows, viewLabel, stepIndex } = (await load(path.join(root, "mods/Codewalker/walkthrough-model.js"))).namespace;
+  const rows = excerptRows({ kind: "diff", hunks: [{ rows: [{ kind: "delete", oldLine: 4, newLine: null, text: "a" }, { kind: "add", oldLine: null, newLine: 4, text: "A" }] },
+    { rows: [{ kind: "context", oldLine: 39, newLine: 40, text: "b" }] }] });
+  assert.deepEqual(Array.from(rows, row => row.kind), ["-", "+", "@", " "]);
+  assert.equal(rows[2].text, "⋯ line 40");
+  assert.deepEqual({ ...viewLabel({ kind: "diff", path: "a", side: "old", startLine: 2, endLine: 3 }) }, { path: "a", detail: "Removed lines 2–3" });
+  assert.deepEqual({ ...viewLabel({ kind: "diff", path: "a", startLine: null }) }, { path: "a", detail: "Whole diff" });
+  assert.deepEqual({ ...viewLabel({ kind: "source", path: "a", rev: "base", startLine: 1, endLine: 1 }) }, { path: "a", detail: "Old version · line 1" });
+  assert.equal(viewLabel(null), null);
+  assert.equal(stepIndex({ steps: [{ id: "a" }, { id: "b" }] }, "gone", 5), 1);
+});
+
+test("a remote helper without walkthroughs is refused before it runs", async () => {
+  const { client, calls } = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 2 } });
+  await assert.rejects(client.walkthrough({ on: "vps", root: "/checkout" }, "w1"), error => error.code === "remote_helper_outdated");
+  assert.equal(calls.some(call => call.args.includes("walkthrough")), false);
 });

@@ -5,6 +5,8 @@ import { ReviewClient, HUMAN, machineOf } from "./client.js";
 import { PullRequests } from "./pull-requests.js";
 import { History } from "./history.js";
 import { dockExpand, RESTORE_TIMEOUT } from "./dock-expand.js";
+import { walkthroughBody, walkthroughList } from "./walkthrough.js";
+import { stepIndex } from "./walkthrough-model.js";
 import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, activeThreads, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody, quote } from "./model.js";
 
 const stop = (_event, cx) => cx.stop_propagation();
@@ -14,11 +16,11 @@ const CACHE_FILES = 24, CACHE_ROWS = 60_000;
 // pending mutation or draft receipt. Cached discussions stay read-only until refreshed.
 const COMPARISON_FIELDS = ["root", "reviewId", "snapshotId", "revision", "branch", "resolvedBase",
   "commitOid", "commitParents", "files", "threads", "note", "file", "rows", "fileNote",
-  "rowsSnapshot", "rowsFingerprint", "page", "from"];
+  "rowsSnapshot", "rowsFingerprint", "page", "from", "walkthroughs"];
 // Git's object/log writes never change a review; everything else may.
 const GIT_NOISE = /\/\.git\/(?:objects|logs)\//;
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const ICON = Object.fromEntries(["git-branch", "plus", "message", "refresh", "folder", "x", "check", "pencil", "reply", "trash", "send", "maximize-2", "minimize-2"].map(name => [name, `mods/Codewalker/icons/${name}.svg`]));
+const ICON = Object.fromEntries(["git-branch", "plus", "message", "refresh", "folder", "x", "check", "pencil", "reply", "trash", "send", "maximize-2", "minimize-2", "arrow-left", "book-open"].map(name => [name, `mods/Codewalker/icons/${name}.svg`]));
 const REVIEW_DOCK = { panel: "panel", stack: "panel-body", child: "review" };
 const panelExpander = dockExpand({ layout, run, shared, setShared });
 // Icons are Lucide (ISC), written by scripts/lucide_icons.py; see icons/LICENSE.
@@ -148,6 +150,12 @@ export default class Codewalker extends View {
     this.base = typeof p.base === "string" ? p.base : "";
     this.commitRef = typeof p.commit === "string" ? p.commit : "";
     this.commitOid = null;
+    // props.walkthrough: this view shows that walkthrough; Back returns to Review.
+    this.walkthroughId = typeof p.walkthrough === "string" && p.walkthrough ? p.walkthrough : null;
+    this.walkthrough = null;
+    this.walkthroughs = [];
+    this.walkthroughConfirm = null;
+    this.step = 0;
     this.prBase = this.prHead = this.prBranch = null;
     this.pullRequest = null;
     this.prTab = "description";
@@ -326,6 +334,7 @@ export default class Codewalker extends View {
   isHistory() { return this.source === "branch" || this.source === "commit"; }
 
   refresh(cx, quiet = false) {
+    if (this.walkthroughId) { this.readWalkthrough(cx, { quiet }); return; }
     if (this.isHistory()) this.history.refresh(this, cx, quiet);
     if (this.source === "pr") {
       if (this.folder) this.pullRequests.refresh(this, cx, quiet);
@@ -363,6 +372,7 @@ export default class Codewalker extends View {
   // One helper read returns the file list, discussions, drafts and one file's
   // hunks. At most one read runs; a newer request replaces the queued one.
   read(cx, { path, quiet = true, retry = false, resolveCommit = false } = {}) {
+    if (this.walkthroughId) { this.readWalkthrough(cx, { quiet, retry }); return; }
     if (!this.folder || (this.source === "pr" && !this.prHead)) return;
     const want = { path: path === undefined ? this.pendingFile ?? this.file : path, quiet, retry, resolveCommit };
     if (!quiet) { this.loading = true; this.error = null; }
@@ -417,10 +427,12 @@ export default class Codewalker extends View {
     if (this.source === "branch" && !this.baseInput.value()) this.baseInput.set_value(this.base);
     this.files = review.files;
     this.threads = review.threads;
+    this.walkthroughs = review.walkthroughs ?? [];
     this.note = review.note;
     this.error = null;
     if (!this.intent && !this.draftsLoaded && review.drafts) {
-      this.drafts = review.drafts;
+      // A walkthrough reply draft is restored in its walkthrough, not here.
+      this.drafts = review.drafts.filter(draft => !draft.intent?.walkthroughId);
       this.draftsLoaded = true;
     }
     if (review.detail) this.remember(review.detail);
@@ -556,6 +568,7 @@ export default class Codewalker extends View {
   }
 
   visibleThreads() {
+    if (this.walkthroughId) return this.threads;
     return this.filter === "all" ? this.threads : activeThreads(this.threads, this.files);
   }
 
@@ -597,6 +610,7 @@ export default class Codewalker extends View {
     this.following = here.key;
     this.withSavedDraft(cx, cx => {
       this.following = null;
+      this.walkthroughId = null;
       this.followed = here.key;
       this.spaceId = here.space;
       this.folder = here.folder;
@@ -618,6 +632,7 @@ export default class Codewalker extends View {
     if (folder === this.folder && on === this.on) { this.editRoot = false; cx.notify(); return; }
     this.withSavedDraft(cx, cx => {
       // Holds until focus moves to another folder.
+      this.walkthroughId = null;
       this.folder = folder;
       this.followed = location(this.spaceId)?.key ?? this.followed;
       this.on = on;
@@ -726,6 +741,9 @@ export default class Codewalker extends View {
     this.files = [];
     this.rows = [];
     this.threads = [];
+    this.walkthrough = null;
+    this.walkthroughs = [];
+    this.walkthroughConfirm = null;
     this.note = this.fileNote = this.branch = this.resolvedBase = null;
     this.page = 0;
     this.from = null;
@@ -777,6 +795,7 @@ export default class Codewalker extends View {
   // A recently viewed file shows at once; otherwise the previous diff stays,
   // dimmed, until the new one arrives. No blank flash between files.
   open(path, cx) {
+    if (this.walkthroughId) return;
     if (this.source === "pr") this.prTab = "changes";
     const hit = this.cached(path);
     if (hit) this.show(path, hit);
@@ -921,7 +940,7 @@ export default class Codewalker extends View {
     cx.notify();
   }
 
-  // The agent answers this comment in a few sentences here, then goes on with its work.
+  // Off: the agent can answer in chat. On: it must also answer in this thread.
   setAskReply(checked, cx) {
     if (!this.intent || this.saving || this.leaving || this.postAttempt) return;
     this.askReply = checked;
@@ -1248,6 +1267,160 @@ export default class Codewalker extends View {
     cx.notify();
   }
 
+  // Walkthroughs ----------------------------------------------------------
+
+  // Like read: at most one in flight, the newest request queued. Step threads
+  // replace this view's threads, so Send, resolve, edit and delete work unchanged.
+  readWalkthrough(cx, { quiet = true, retry = false } = {}) {
+    if (!this.folder || !this.walkthroughId) return;
+    if (!quiet) { this.loading = true; this.error = null; }
+    if (this.reading) { this.queued = { quiet: quiet && (this.queued?.quiet ?? true) }; return; }
+    this.reading = true;
+    const version = this.contextVersion, context = this.context(), id = this.walkthroughId;
+    cx.spawn(async cx => {
+      let next = null;
+      try {
+        const result = await this.client.walkthrough(context, id);
+        if (version !== this.contextVersion || id !== this.walkthroughId) return;
+        if (!this.applyWalkthrough(result, retry, cx)) next = { quiet: true, retry: true };
+      } catch (error) {
+        if (version === this.contextVersion) this.error = error.code === "not_found" ? "This walkthrough is not in this checkout and branch. It may have been deleted. Go back to Review." : readableError(error);
+      } finally {
+        if (version === this.contextVersion) {
+          this.reading = false;
+          next = this.queued ?? next;
+          this.queued = null;
+          if (next) this.readWalkthrough(cx, next);
+          else this.loading = false;
+        }
+        cx.notify();
+      }
+    });
+    if (!quiet) cx.notify();
+  }
+
+  applyWalkthrough(result, retry, cx) {
+    const same = result.reviewId === this.reviewId;
+    if (same && !retry && Number.isInteger(this.revision) && result.revision < this.revision) return false;
+    const shown = this.walkthrough?.steps[this.step]?.id;
+    this.root = result.root;
+    this.reviewId = result.reviewId;
+    this.revision = result.revision;
+    this.branch = result.branch;
+    this.walkthrough = result.walkthrough;
+    this.step = stepIndex(result.walkthrough, shown, this.step);
+    this.threads = result.walkthrough.steps.map(step => step.thread);
+    this.error = null;
+    if (!this.intent && !this.draftsLoaded) { this.drafts = result.drafts; this.draftsLoaded = true; }
+    this.watch(cx, result.root, result.storePath);
+    return true;
+  }
+
+  // A resolve or reply updates this.threads before the next read.
+  stepThread(step) {
+    return this.threads.find(thread => thread.id === step.thread.id) ?? step.thread;
+  }
+
+  // A reply being written is saved as a draft first; Continue draft brings it back.
+  goStep(index, cx) {
+    const count = this.walkthrough?.steps.length ?? 0;
+    if (index < 0 || index >= count || index === this.step) return;
+    if (this.editing) {
+      if (this.editor.value() !== this.editing.body) { this.error = "Save or cancel the open edit first."; cx.notify(); return; }
+      this.cancelEdit(cx);
+    }
+    this.withSavedDraft(cx, cx => {
+      if (this.intent) { this.intent = null; this.composer.set_value(""); this.draftsLoaded = false; this.refresh(cx, true); }
+      this.step = index;
+      this.confirmDelete = null;
+      cx.notify();
+    });
+  }
+
+  beginStepReply(thread, cx) {
+    if (this.saving || this.leaving || !this.walkthroughId) return;
+    const draft = (this.drafts ?? []).find(item => item.intent?.threadId === thread.id);
+    if (draft) { this.restoreDraft(draft, cx); return; }
+    this.withSavedDraft(cx, cx => {
+      this.intent = { id: newId(), path: thread.path, anchor: thread.anchor, threadId: thread.id, walkthroughId: this.walkthroughId, snapshotId: null, context: this.context(), replyRequested: this.askReply };
+      this.composer.set_value("");
+      this.composer.focus();
+      this.draftStatus = "";
+      this.mutationId = null;
+      cx.notify();
+    });
+  }
+
+  // In place, from Review's list. Review's comparison comes back on Back.
+  openWalkthrough(id, cx) {
+    if (this.saving || this.leaving || this.sending || this.viewing || this.editing?.saving) return;
+    this.withSavedDraft(cx, cx => {
+      this.rememberComparison();
+      this.resetContext({ keepComparisons: true });
+      this.walkthroughId = id;
+      this.step = 0;
+      this.mode = "files";
+      this.readWalkthrough(cx, { quiet: false });
+      cx.notify();
+    });
+  }
+
+  closeWalkthrough(cx) {
+    if (this.saving || this.leaving || this.sending || this.editing?.saving) return;
+    this.withSavedDraft(cx, cx => {
+      this.walkthroughId = null;
+      this.resetContext({ keepComparisons: true });
+      this.step = 0;
+      const restored = this.restoreComparison();
+      this.mode = "walkthroughs";
+      if (this.source === "pr") this.refresh(cx);
+      else this.read(cx, { quiet: restored });
+      if (this.isHistory()) this.history.refresh(this, cx, true);
+      cx.notify();
+    });
+  }
+
+  setWalkthroughStatus(status, cx) {
+    if (!this.walkthrough || this.saving) return;
+    const context = this.context(), version = this.contextVersion;
+    this.saving = true;
+    cx.spawn(async cx => {
+      try {
+        const result = await this.client.setWalkthroughStatus(context, this.walkthroughId, status, newId());
+        if (version !== this.contextVersion) return;
+        if (result.revision >= this.revision) this.walkthrough = { ...this.walkthrough, status };
+        this.wrote(result);
+        this.refresh(cx, true);
+      } catch (error) { if (version === this.contextVersion) this.error = readableError(error); }
+      finally { this.saving = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  // Two steps, like a message: Delete asks, the red Delete removes it for good.
+  deleteWalkthrough(cx) {
+    if (!this.walkthrough || this.saving || this.postAttempt) return;
+    if (this.walkthroughConfirm !== this.walkthroughId) { this.walkthroughConfirm = this.walkthroughId; cx.notify(); return; }
+    const context = this.context(), version = this.contextVersion, id = this.walkthroughId;
+    this.saving = true;
+    this.error = null;
+    cx.spawn(async cx => {
+      try {
+        this.wrote(await this.client.deleteWalkthrough(context, id, newId()));
+        if (version !== this.contextVersion) return;
+        this.walkthroughConfirm = null;
+        // Its reply drafts have nothing left to answer. A failed cleanup leaves only a hidden draft.
+        const drafts = new Set([...(this.drafts ?? []).filter(draft => draft.intent?.walkthroughId === id).map(draft => draft.id), ...(this.intent?.walkthroughId === id ? [this.intent.id] : [])]);
+        if (this.intent?.walkthroughId === id) { this.intent = null; this.composer.set_value(""); }
+        for (const draftId of drafts) { try { this.wrote(await this.client.deleteDraft(context, draftId)); } catch { /* Hidden: no walkthrough shows it. */ } }
+        this.saving = false;
+        this.closeWalkthrough(cx);
+      } catch (error) { if (version === this.contextVersion) this.error = `Not deleted: ${readableError(error)}`; }
+      finally { this.saving = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
   cardHeader(t, children) {
     return h_flex().min_h(34).px(12).gap(8).items_center().border_b(1).border_color(t.border).children(children);
   }
@@ -1308,7 +1481,7 @@ export default class Codewalker extends View {
         .when(actor.kind === "Agent", el => el.child(div().px(5).rounded(4).text_size(10).bg(tint(t.accent, 0x26)).text_color(t.accent).child("Agent")))
         .child(div().text_size(10).text_color(t.dim).child(timestamp(message.createdAt)))
         .when(Boolean(message.editedAt), el => el.child(div().text_size(10).text_color(t.dim).child("· edited")))
-        .when(message.replyRequested === true, el => el.child(div().min_w(0).truncate().text_size(10).text_color(t.dim).child("· asked for a short reply")))
+        .when(message.replyRequested === true, el => el.child(div().min_w(0).truncate().text_size(10).text_color(t.dim).child("· asked for a reply in thread")))
         .child(div().flex_1())
         .when(canEdit && !confirming && !first, el => el
           .child(this.button(`${prefix}-edit-${message.id}`, "Edit", cx => this.startEdit(message, cx), { small: true, ghost: true, icon: ICON.pencil, label: "Edit your message" }))
@@ -1478,8 +1651,8 @@ export default class Codewalker extends View {
     const busy = this.saving || this.leaving, failed = this.draftStatus.startsWith("Draft not saved");
     return v_flex().id("discussion-composer").ml(inline ? this.cols.inset : 12).mr(this.cols.edge).my(6).rounded(8).border_1().border_color(t.accent).bg(t.surface).overflow_hidden()
       .child(this.cardHeader(t, [
-        div().flex_1().min_w(0).truncate().font_semibold().text_size(12).child(intent.threadId ? `Reply · ${anchorLabel(intent.anchor)}` : `Comment on ${anchorLabel(intent.anchor).replace(/^[A-Z]/, c => c.toLowerCase())}`),
-        ...(intent.path !== this.file ? [div().flex_none().text_size(11).text_color(t.dim).child(splitPath(intent.path ?? "").name)] : []),
+        div().flex_1().min_w(0).truncate().font_semibold().text_size(12).child(intent.walkthroughId ? `Reply · step ${this.step + 1}` : intent.threadId ? `Reply · ${anchorLabel(intent.anchor)}` : `Comment on ${anchorLabel(intent.anchor).replace(/^[A-Z]/, c => c.toLowerCase())}`),
+        ...(!intent.walkthroughId && intent.path !== this.file ? [div().flex_none().text_size(11).text_color(t.dim).child(splitPath(intent.path ?? "").name)] : []),
         this.button("close-draft", "", cx => this.closeComposer(cx), { small: true, ghost: true, icon: ICON.x, tooltip: "Close · the draft is kept", enabled: !busy }),
       ]))
       .when(!intent.threadId && intent.snapshotId !== this.snapshotId, el => el.child(div().px(12).pt(8).text_size(11).text_color(t.blocked)
@@ -1496,15 +1669,15 @@ export default class Codewalker extends View {
   askReplyBox(busy) {
     const t = theme(), checked = this.intent?.replyRequested === true, enabled = !busy && !this.postAttempt;
     // Tooltips need a plain element; a Checkbox does not take one.
-    return div().id("ask-reply-tip").flex_none().tooltip("The agent answers here in a few sentences, then goes on with its work").child(Checkbox.new("ask-reply").checked(checked).disabled(!enabled)
-      .accessibility_label("Ask the agent for a short reply here")
+    return div().id("ask-reply-tip").flex_none().tooltip("The agent must answer in this thread, not only in its chat").child(Checkbox.new("ask-reply").checked(checked).disabled(!enabled)
+      .accessibility_label("Ask the agent to reply in this thread")
       .when(enabled, el => el.cursor_pointer())
       .on_mouse_down("left", stop).on_change((value, cx) => this.setAskReply(value, cx))
       .child(h_flex().gap(6).items_center().text_size(11).text_color(checked ? t.foreground : t.muted)
         .child(div().size(14).flex_none().flex().items_center().justify_center().rounded(4).border_1()
           .border_color(checked ? t.accent : t.border).bg(checked ? t.accent : t.background)
           .when(checked, el => el.child(svg(ICON.check).size(11).text_color(t.accent_foreground))))
-        .child("Ask for a short reply")));
+        .child("Reply in thread")));
   }
 
   // The range being dragged, else the open draft's lines in this file.
@@ -1519,11 +1692,12 @@ export default class Codewalker extends View {
     return row => { const line = lineOf(row, side); return Boolean(line) && line >= startLine && line <= endLine; };
   }
 
-  diffRow(row, index, marked, live) {
+  // `corner`: round the bottom of the last row in a bordered card, which does not clip.
+  diffRow(row, index, marked, live, corner = 0) {
     const t = theme(), look = settings(), mono = look.font_family, fontSize = look.font_size ?? 12;
     // Follow Herdr's live code size; leave room for the 16px hover button and larger fonts.
     const rowH = Math.max(18, Math.ceil(fontSize * 1.5)), minus = row.kind === "-", plus = row.kind === "+";
-    if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(Math.max(26, rowH)).px(12).items_center().bg(t.raised)
+    if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(Math.max(26, rowH)).px(12).items_center().bg(t.raised).when(corner > 0, el => el.rounded_b(corner))
       .font_family(mono).text_size(fontSize).text_color(t.dim).child(div().truncate().child(row.text));
     const tone = plus ? t.ansi2 : minus ? t.ansi1 : null, hovered = live && !this.drag && this.hoverRow === index;
     const number = (side, line) => div().id(`line-${index}-${side}`).w(this.cols.num).h(rowH).flex_none().flex().items_center().justify_end().pr(this.cols.num > 40 ? 8 : 5)
@@ -1536,10 +1710,10 @@ export default class Codewalker extends View {
       .when(hovered, el => el.cursor_pointer().child(div().size(16).rounded(4).flex().items_center().justify_center().bg(t.accent)
         .child(svg(ICON.plus).size(11).text_color(t.accent_foreground))));
     return h_flex().id(`row-${index}`).min_h(rowH).items_stretch().font_family(mono).text_size(fontSize).line_height(`${rowH}px`)
-      .bg(marked ? tint(t.accent, 0x24) : tone ? tint(tone, 0x14) : t.background)
+      .bg(marked ? tint(t.accent, 0x24) : tone ? tint(tone, 0x14) : t.background).when(corner > 0, el => el.rounded_b(corner))
       .when(live && !marked, el => el.hover(s => s.bg(tone ? tint(tone, 0x26) : t.hover)))
       .when(live, el => el.on_hover((inside, cx) => this.hoverLine(index, inside, cx)))
-      .child(h_flex().flex_none().items_start().bg(marked ? tint(t.accent, 0x48) : tone ? tint(tone, 0x26) : "#00000000")
+      .child(h_flex().flex_none().items_start().bg(marked ? tint(t.accent, 0x48) : tone ? tint(tone, 0x26) : "#00000000").when(corner > 0, el => el.rounded_bl(corner))
         .child(number("old", row.oldLine)).child(number("new", row.newLine)))
       .child(comment)
       .child(div().w(SIGN_W).flex_none().text_color(tone ?? t.dim).child(plus ? "+" : minus ? "−" : ""))
@@ -1598,6 +1772,23 @@ export default class Codewalker extends View {
     return v_flex().id("pr-empty").flex_1().min_h(0).child(content);
   }
 
+  // A walkthrough's toolbar: back to Review, its title, refresh and Send.
+  walkthroughControls(compact, expansion, expandLabel) {
+    const t = theme(), busy = this.saving || this.leaving || this.sending || Boolean(this.editing?.saving);
+    return h_flex().id("walkthrough-controls").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).items_center().border_b(1).border_color(t.border)
+      .child(this.button("walkthrough-back", compact ? "" : "Review", cx => this.closeWalkthrough(cx), { icon: ICON["arrow-left"], label: "Back to Review", tooltip: "Back to Review · the walkthrough is kept", enabled: !busy }))
+      .child(h_flex().flex_1().min_w(0).gap(6).items_center()
+        .child(svg(ICON["book-open"]).size(13).flex_none().text_color(t.muted))
+        .child(div().min_w(0).truncate().font_semibold().text_size(12).child(this.walkthrough?.title ?? "Walkthrough")))
+      .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : "Refresh", enabled: !this.loading && !this.saving }))
+      .when(this.mode === "send" || sendable(this.visibleThreads()).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
+      .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close · drafts are kept", enabled: !this.saving })))
+      .when(Boolean(expansion?.supported), el => el.child(this.button("expand-review", "", cx => this.toggleExpansion(cx), {
+        icon: ICON[expansion.expanded ? "minimize-2" : "maximize-2"], tooltip: expandLabel, selected: expansion.expanded,
+        enabled: !expansion.restoring && expansion.reason !== "at-max",
+      })));
+  }
+
   render(cx) {
     if (this.launcher) return div();
     if (this.toolbar || (!this.framed && !props()?.overlay)) this.reconcileExpansion(cx);
@@ -1650,7 +1841,8 @@ export default class Codewalker extends View {
     const changed = new Set(this.files.map(file => file.path));
     const threadsAt = path => shownThreads.filter(thread => thread.path === path);
     const openAt = path => threadsAt(path).some(thread => thread.status !== "resolved");
-    const retainedPaths = [...new Set(shownThreads.map(thread => thread.path).filter(path => !changed.has(path)))];
+    // A walkthrough shows no file list, and a step with no view has no path.
+    const retainedPaths = this.walkthroughId ? [] : [...new Set(shownThreads.map(thread => thread.path).filter(path => path && !changed.has(path)))];
     const hiddenCount = this.threads.length - shownThreads.length;
     // Side by side, a 240px list has no room for line counts; stacked, it spans the panel.
     const counts = !wide || width >= 1000;
@@ -1660,6 +1852,7 @@ export default class Codewalker extends View {
     const current = this.files.find(file => file.path === selected);
     const openCount = shownThreads.filter(thread => thread.status !== "resolved").length, draftCount = this.drafts?.length ?? 0;
     const awaiting = shownThreads.filter(thread => thread.awaitingReply).length;
+    const walking = Boolean(this.walkthroughId), openWalkthroughs = this.walkthroughs.filter(item => item.status !== "archived").length;
 
     const root = this.root ?? this.folder;
     const { name: fileName, dir: fileDir } = splitPath(selected ?? "");
@@ -1743,18 +1936,25 @@ export default class Codewalker extends View {
       .on_mouse_up("left", (_event, cx) => this.release(cx))
       .on_key_down((event, cx) => {
         if (this.history.onKey(this, event, cx)) { cx.stop_propagation(); return; }
+        if (walking && this.walkthrough && this.mode !== "send" && !this.intent && !this.editing && !this.drag && ["left", "right"].includes(event.key)) {
+          this.goStep(this.step + (event.key === "right" ? 1 : -1), cx);
+          cx.stop_propagation();
+          return;
+        }
         if (event.key !== "escape") return;
         if (this.drag) { this.drag = null; cx.notify(); cx.stop_propagation(); }
         else if (this.history.picking || this.history.entry) { this.history.dismiss(); this.handle.focus(); cx.notify(); cx.stop_propagation(); }
         else if (this.clearAttempt && !this.saving) { this.clearAttempt = null; cx.notify(); cx.stop_propagation(); }
+        else if (this.walkthroughConfirm && !this.saving) { this.walkthroughConfirm = null; cx.notify(); cx.stop_propagation(); }
         else if (this.confirmDelete) { this.confirmDelete = null; cx.notify(); cx.stop_propagation(); }
         else if (this.editing) { this.cancelEdit(cx); cx.stop_propagation(); }
         else if (this.intent) { this.closeComposer(cx); cx.stop_propagation(); }
         else if (this.mode === "send") { this.mode = this.backMode ?? "files"; cx.notify(); cx.stop_propagation(); }
-        else if (this.mode === "discussions") { this.mode = "files"; cx.notify(); cx.stop_propagation(); }
+        else if (this.mode === "discussions" || this.mode === "walkthroughs") { this.mode = "files"; cx.notify(); cx.stop_propagation(); }
       })
       // One compact toolbar; comparison details live in tooltips, not a title row.
-      .child(h_flex().id("review-controls").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
+      .when(walking, el => el.child(this.walkthroughControls(compact, expansion, expandLabel)))
+      .when(!walking, el => el.child(h_flex().id("review-controls").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
         .child(this.segments("scope", [["uncommitted", "Uncommitted"], ["history", "History"], ["pr", "Pull request"]], this.isHistory() ? "history" : this.source, (source, cx) => {
           if (source === "history") this.applyHistory(cx);
           else this.applySource(source, cx);
@@ -1766,15 +1966,17 @@ export default class Codewalker extends View {
         .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : this.source === "pr" ? "Refresh the current branch’s PR and compare its latest head" : "Refresh", enabled: !this.loading && !this.pullRequests.loading && !this.history.loading && !this.saving }))
         .child(this.button("toggle-discussions", !compact && openCount ? String(openCount) : "", cx => { this.mode = this.mode === "discussions" ? "files" : "discussions"; cx.notify(); },
           { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `${this.filter === "all" ? "All" : "Active"} discussions · ${openCount} open` }))
+        .when(this.walkthroughs.length > 0 || this.mode === "walkthroughs", el => el.child(this.button("toggle-walkthroughs", !compact && openWalkthroughs ? String(openWalkthroughs) : "", cx => { this.mode = this.mode === "walkthroughs" ? "files" : "walkthroughs"; cx.notify(); },
+          { icon: ICON["book-open"], selected: this.mode === "walkthroughs", label: "Walkthroughs", tooltip: this.mode === "walkthroughs" ? "Back to changed files" : `Walkthroughs by agents · ${openWalkthroughs} open` })))
         .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${this.on ? `${this.on}: ` : ""}${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
         .when(this.mode === "send" || sendable(this.visibleThreads()).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
         .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving })))
         .when(Boolean(expansion?.supported), el => el.child(this.button("expand-review", "", cx => this.toggleExpansion(cx), {
           icon: ICON[expansion.expanded ? "minimize-2" : "maximize-2"], tooltip: expandLabel, selected: expansion.expanded,
           enabled: !expansion.restoring && expansion.reason !== "at-max",
-        }))))
-      .when(this.isHistory(), el => el.child(this.history.controls(this)))
-      .when(this.source === "pr" && Boolean(this.pullRequest), el => el.child(h_flex().id("pr-tabs").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
+        })))))
+      .when(!walking && this.isHistory(), el => el.child(this.history.controls(this)))
+      .when(!walking && this.source === "pr" && Boolean(this.pullRequest), el => el.child(h_flex().id("pr-tabs").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
         .child(this.segments("pr-tab", [["description", "Description"], ["changes", "Changes"]], this.mode === "files" ? this.prTab : "changes", (tab, cx) => this.setPRTab(tab, cx), {
           compact, disabled: this.saving || this.leaving || this.editing?.saving === true,
           label: (_tab, label) => `Show pull request ${label.toLowerCase()}`,
@@ -1786,7 +1988,7 @@ export default class Codewalker extends View {
           cx.write_to_clipboard(`git -C ${quote(this.folder)} fetch --no-tags -- ${quote(url)} ${quote(this.prBase)} ${quote(this.prHead)}`);
         }, { small: true, tooltip: "Copy a command to fetch the pinned PR commits on the checkout's machine. Codewalker does not run it." })))))
       // Folder entry: on request, or until a checkout loads.
-      .when(this.editRoot || (!this.folder || (this.source !== "pr" && !this.root && !this.reading)), el => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
+      .when(!walking && (this.editRoot || (!this.folder || (this.source !== "pr" && !this.root && !this.reading))), el => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
           .child(Input.new(this.rootInput).h_full().text_size(12).text_color(t.foreground)))
         .when(this.editRoot && Boolean(this.root), el => el.child(this.button("cancel-root", "Cancel", cx => { this.editRoot = false; cx.notify(); }, { ghost: true })))
@@ -1798,11 +2000,14 @@ export default class Codewalker extends View {
       .when(Boolean(this.note), el => el.child(div().flex_none().px(14).py(6).text_size(11).text_color(t.muted).border_b(1).border_color(t.border).child(this.note)))
       // Side by side: h_flex centers by default, so stretch both columns or their scroll regions
       // collapse. Stacked: a native divider resizes files and diff without remounting editors.
-      .child(this.source === "pr" && !this.pullRequest ? this.prEmptyView() : this.mode === "send" ? this.sendView() : this.mode === "discussions" ? this.discussionsView(cx) : this.source === "pr" && this.prTab === "description" ? this.pullRequests.description(this, this.pullRequest)
+      .child(walking ? (this.mode === "send" ? this.sendView() : walkthroughBody(this, { wide, compact }, cx))
+        : this.source === "pr" && !this.pullRequest ? this.prEmptyView() : this.mode === "send" ? this.sendView() : this.mode === "discussions" ? this.discussionsView(cx) : this.mode === "walkthroughs" ? walkthroughList(this) : this.source === "pr" && this.prTab === "description" ? this.pullRequests.description(this, this.pullRequest)
         : reviewBody)
       .child(h_flex().h(26).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border).text_size(11)
         .child(div().size(6).flex_none().rounded_full().bg(this.error || this.history.error && this.isHistory() ? t.blocked : this.reading || this.pullRequests.loading || this.history.loading ? t.working : t.idle))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(this.source === "pr" && !this.pullRequest ? "" : !this.reviewId ? (this.on ? `${this.on} · Not connected` : "Not connected")
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(walking ? (!this.walkthrough ? (this.on ? `${this.on} · Walkthrough` : "Walkthrough")
+            : [...(this.on ? [this.on] : []), `Step ${this.step + 1} of ${this.walkthrough.steps.length}`, `${openCount} open`, ...(awaiting ? [`${awaiting} awaiting reply`] : [])].join(" · "))
+          : this.source === "pr" && !this.pullRequest ? "" : !this.reviewId ? (this.on ? `${this.on} · Not connected` : "Not connected")
           : [...(this.on ? [this.on] : []), `${this.files.length} ${this.files.length === 1 ? "file" : "files"}`, `${openCount} open`, ...(awaiting ? [`${awaiting} awaiting reply`] : []), ...(draftCount ? [`${draftCount} ${draftCount === 1 ? "draft" : "drafts"}`] : [])].join(" · "))));
   }
 }

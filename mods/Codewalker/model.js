@@ -132,10 +132,22 @@ export const quote = text => `'${String(text).replaceAll("'", "'\\''")}'`;
 export function sendText({ items, root, branch, helper, note }) {
   const lines = [`Code review feedback from Codewalker for ${root}${branch ? ` (branch ${branch})` : ""}: ${items.length} ${items.length === 1 ? "discussion" : "discussions"}.`];
   if (note?.trim()) lines.push("", note.trim());
+  const walkthroughs = new Map();
   for (const { thread, messageIds } of items) {
-    const a = thread.anchor ?? {};
+    const a = thread.anchor ?? {}, w = thread.walkthrough;
+    if (w) {
+      // A walkthrough step: the agent wrote its first message, so only the replies
+      // are pasted. How to read the steps is said once per walkthrough, at the end.
+      walkthroughs.set(w.id, w.title);
+      lines.push("", `### Walkthrough "${w.title}", step ${w.position + 1} of ${w.stepCount}: ${w.stepTitle} · thread ${thread.id}${threadIsOutdated(thread) ? " · code changed since" : ""}${thread.awaitingReply ? " · reply in thread required" : ""}`);
+      for (const message of thread.messages.slice(1)) {
+        const who = isHuman(message) ? "Reviewer" : `${message.actor?.name ?? "Agent"} (${message.actor?.kind ?? "agent"})`;
+        lines.push(`${who}${messageIds.includes(message.id) ? " (new)" : ""}: ${message.body}`);
+      }
+      continue;
+    }
     const range = a.startLine === a.endLine ? `line ${a.startLine}` : `lines ${a.startLine}-${a.endLine}`;
-    lines.push("", `### ${thread.path}, ${range}${a.side === "old" ? " (removed side)" : ""} · thread ${thread.id}${threadIsOutdated(thread) ? " · code changed since" : ""}${thread.awaitingReply ? " · short reply requested" : ""}`);
+    lines.push("", `### ${thread.path}, ${range}${a.side === "old" ? " (removed side)" : ""} · thread ${thread.id}${threadIsOutdated(thread) ? " · code changed since" : ""}${thread.awaitingReply ? " · reply in thread required" : ""}`);
     if (a.commitOid) lines.push(`Historical commit ${a.commitOid}; inspect the current code before making changes.`);
     if (a.snippet) lines.push("```", a.snippet, "```");
     for (const message of thread.messages) {
@@ -144,7 +156,9 @@ export function sendText({ items, root, branch, helper, note }) {
     }
   }
   // How to answer lives in the helper's `skill` output, so the paste stays short.
-  lines.push("", "---", `Before you act, read how to answer in these threads: python3 ${quote(helper)} skill --repo ${quote(root)}`);
+  lines.push("", "---");
+  for (const [id, title] of walkthroughs) lines.push(`Your step text in walkthrough "${title}" is not repeated above. Read it with: python3 ${quote(helper)} --repo ${quote(root)} walkthrough --walkthrough ${id} --json`);
+  lines.push(`Before you act, read how to answer in these threads: python3 ${quote(helper)} skill --repo ${quote(root)}`);
   return lines.join("\n");
 }
 
