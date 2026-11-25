@@ -33,7 +33,7 @@ export default class Preview extends Codewalker {
     this.width = 900;
     this.height = 620;
     this.folder = this.root = "/demo/taskboard";
-    this.client = { saveDraft: async () => ({}), deleteDraft: async () => ({}) };
+    this.client = { saveDraft: async () => ({}), deleteDraft: async () => ({}), helperPath: () => "/example/Codewalker/backend.py" };
     this.history.refresh = () => {};
     this.reviewId = "demo-review";
     this.snapshotId = this.rowsSnapshot = "demo-snapshot";
@@ -97,6 +97,15 @@ export default class Preview extends Codewalker {
     if (scene === "history-branches") this.history.picking = true;
     if (scene === "history-edit-base") { this.source = "branch"; this.history.entry = "base"; }
     if (scene === "history-go-commit") this.history.entry = "commit";
+    if (scene === "walkthroughs") {
+      // Review's list of the walkthroughs on this branch: one open, one archived.
+      const agent = { kind: "agent", id: "demo", name: "Agent" };
+      this.walkthroughs = [
+        { id: "demo-walkthrough", title: "Safe job retries", summary: "", status: "open", author: agent, createdAt: "2026-01-01T11:00:00Z", updatedAt: "2026-01-01T11:05:00Z", stepCount: 3, openThreads: 3, awaitingReply: 1, replies: 2 },
+        { id: "demo-archived", title: "Queue layout notes", summary: "", status: "archived", author: agent, createdAt: "2025-12-01T10:00:00Z", updatedAt: "2025-12-01T10:05:00Z", stepCount: 1, openThreads: 0, awaitingReply: 0, replies: 0 },
+      ];
+      this.mode = "walkthroughs";
+    }
     if (scene === "walkthrough") {
       // An agent's tour of the same change: one intro, one diff step, one unchanged caller.
       const agent = { kind: "agent", id: "demo", name: "Agent" }, you = { kind: "human", id: "local", name: "You" };
