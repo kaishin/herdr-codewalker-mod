@@ -246,4 +246,4 @@ Publication requires a public GitHub repository containing this package and the 
 
 Codewalker is [MIT licensed](LICENSE), copyright © 2026 Reda Lemeden. The self-contained mod folder includes a copy of the license.
 
-Third-party assets retain their own terms: [Lucide/Feather icons](mods/Codewalker/icons/LICENSE) use ISC/MIT; the Inter font used only for preview artwork uses [SIL OFL 1.1](okf/preview-assets/INTER-LICENSE.txt).
+Third-party assets retain their own terms: [Lucide/Feather icons](mods/Codewalker/icons/LICENSE) use ISC/MIT; the [syntax tokenizer](mods/Codewalker/highlight.js) from herdr-reviewer and the [History lane layout](mods/Codewalker/lanes.js) use MIT ([LICENSE-reviewer](mods/Codewalker/LICENSE-reviewer), [LICENSE-lanes](mods/Codewalker/LICENSE-lanes)); the Inter font used only for preview artwork uses [SIL OFL 1.1](okf/preview-assets/INTER-LICENSE.txt).

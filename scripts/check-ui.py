@@ -4,6 +4,7 @@
 This does not lay out or paint. A populated live Review screenshot is still required.
 """
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -92,6 +93,11 @@ def check_content_height(spec, stacked=False):
     )
 
 
+def code(spec):
+    """The spec's text in order: a syntax-colored row is one piece per color."""
+    return "".join(re.findall(r'^\s*text "(.*)"$', spec, re.M))
+
+
 def check_walkthrough_height(spec, stacked):
     """The outline and the step scroll in two regions that fill one row or resize group."""
     lines = spec.splitlines()
@@ -176,7 +182,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="codewalker-native-fixture-") as temp:
         destination = Path(temp).resolve() / "mod"
         destination.mkdir()
-        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "pr-model.js", "pr-client.js", "pull-requests.js", "history.js", "history-client.js", "history-model.js", "lanes.js", "walkthrough.js", "walkthrough-model.js", "mod.json", "review.svg"):
+        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "pr-model.js", "pr-client.js", "pull-requests.js", "history.js", "history-client.js", "history-model.js", "lanes.js", "highlight.js", "walkthrough.js", "walkthrough-model.js", "mod.json", "review.svg"):
             shutil.copy2(ROOT / "mods/Codewalker" / name, destination / ("view.js" if name == "main.js" else name))
         shutil.copytree(ROOT / "mods/Codewalker/icons", destination / "icons")
         # Settled; a file switch in progress (the shown diff stays, dimmed); a
@@ -303,7 +309,7 @@ def main():
                 assert 'Commit 01234567' in spec and 'First parent bbbbbbbb · no uncommitted changes' in spec and 'Branch vs main' in spec, "Commit review names the parent and target once and makes the return to branch clear"
             if extra == cached:
                 check_content_height(spec, stacked=True)
-                assert 'new_value = 2' in spec and 'Button "file-src/example.py"' in spec, "A restored mode shows its files and diff during revalidation"
+                assert 'new_value = 2' in code(spec) and 'Button "file-src/example.py"' in spec, "A restored mode shows its files and diff during revalidation"
                 assert 'Reading changes' not in spec and 'Loading diff' not in spec and '.opacity' not in spec, "Cached mode switches must not blank or dim the diff"
                 checkbox = next(line for line in lines if 'Checkbox "file-viewed"' in line)
                 assert ':disabled[Bool(true)]' in checkbox, "Cached Viewed state is read-only until revalidated"
@@ -358,7 +364,7 @@ def main():
                 # The message body becomes an editor with Cancel and Save; no second Edit.
                 assert '"Save"' in spec and "message-cancel-edit" in spec and "edit-synthetic-human" not in spec, "An edited message shows its editor"
             check_content_height(spec, stacked=narrow)
-            dimmed = ".opacity" in spec and 'new_value = 2' in spec
+            dimmed = ".opacity" in spec and 'new_value = 2' in code(spec)
             assert dimmed == (pending != "null"), "A pending file switch must keep the shown diff, dimmed"
             assert ("icons/plus.svg" in spec) == (extra == hover), "Only a hovered, anchorable row shows the comment button"
             assert ('"Comment on lines 1–2"' in spec) == (extra == hover), "A range comment names its lines"
@@ -418,7 +424,8 @@ def main():
             assert (':disabled[Bool(true)]' in next(line for line in spec.splitlines() if 'Button "walkthrough-next"' in line)) == (step == 2), "Next stops at the last step"
             assert (':id[Str("walkthrough-excerpt-' in spec) == (step != 0), f"{name}: only a step with a view shows code"
             if step == 1:
-                assert 'new_value = 2' in spec and 'old_value = 1' in spec and '"Line 1"' in spec, "A diff step shows the replaced lines and names its range"
+                assert 'new_value = 2' in code(spec) and 'old_value = 1' in code(spec) and '"Line 1"' in spec, "A diff step shows the replaced lines and names its range"
+                assert re.search(r'text_color\[Str\("[^"]+"\)\]\n\s*text "2"', spec), "A step's code has syntax colors"
                 assert "icons/plus.svg" not in spec, "Frozen rows take no new comments"
                 assert 'step-synthetic-step-reply' in spec and 'Button "step-edit-synthetic-step-reply"' in spec, "Your reply can be edited"
                 assert 'step-edit-synthetic-step-body-1' not in spec and 'step-delete-synthetic-step-body-1' not in spec, "The agent's step cannot be changed here"

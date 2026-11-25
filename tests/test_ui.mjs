@@ -31,13 +31,19 @@ async function modules(overrides = {}) {
     "gpui-base": { h_flex() {}, v_flex() {}, v_resizable() {}, resizable_panel() {}, Button: {}, Checkbox: {}, InputState: { new: options => new State(options) }, Input: {}, TextareaState: { new: options => new State(options) }, Textarea: {}, TextView: {}, v_virtual_list() {}, Scrollbar: {}, VirtualListScrollHandle: { new: () => ({ scroll_to_item() {} }) } },
     herdr: { props: () => ({}), spaces: () => [], panes: () => [], focused: () => null, agents: () => [], hc: async () => { throw new Error("Unexpected hc call"); }, run() {}, notify() {}, appHome: () => "/app", home: () => "/home", theme: () => ({}), settings: () => ({}), closeOverlay() {}, layout: () => null, shared: () => undefined, setShared() {}, nextCommand: () => new Promise(() => {}), watchFolder: async () => { throw new Error("No folder watch in tests"); }, exec: async () => { throw new Error("Unexpected helper invocation"); }, ...overrides },
   };
-  async function load(name) {
+  async function create(name) {
     if (cache.has(name)) return cache.get(name);
     const module = values[name]
       ? new vm.SyntheticModule(Object.keys(values[name]), function () { for (const [key, value] of Object.entries(values[name])) this.setExport(key, value); }, { context, identifier: name })
       : new vm.SourceTextModule(await readFile(name, "utf8"), { context, identifier: name });
     cache.set(name, module);
-    await module.link((specifier, parent) => load(specifier.startsWith(".") ? path.resolve(path.dirname(parent.identifier), specifier) : specifier));
+    return module;
+  }
+  // Node links a module's imports itself; linking them here too races when two modules share one.
+  const linker = (specifier, parent) => create(specifier.startsWith(".") ? path.resolve(path.dirname(parent.identifier), specifier) : specifier);
+  async function load(name) {
+    const module = await create(name);
+    if (module.status === "unlinked") await module.link(linker);
     return module;
   }
   const main = await load(path.join(root, "mods/Codewalker/main.js"));
@@ -693,6 +699,30 @@ test("active discussions hide resolved and absent files, keep outdated anchors, 
   assert.equal(ids("active"), ids());
   assert.equal(ids("all"), JSON.stringify([["b.txt", ["t3", "t5"]], ["a.txt", ["t4", "t2"]], ["gone.txt", ["t1"]]]));
   assert.equal(ids("awaiting"), JSON.stringify([["a.txt", ["t2"]]]));
+});
+
+test("diff rows get syntax colors once, only as far as shown, with each side's open comment kept apart", async () => {
+  const { load } = await modules();
+  const { colorRows } = (await load(path.join(root, "mods/Codewalker/model.js"))).namespace;
+  const rows = [
+    { kind: "-", text: "/* old comment" }, { kind: "+", text: "const a = 1;" }, { kind: "-", text: "still old */ x" },
+    { kind: " ", text: "call(\"s\")" }, { kind: "@", text: "@@ -9 +9 @@" }, { kind: "+", text: "*/ not a comment" },
+  ];
+  const classes = row => JSON.stringify(row.spans.filter(span => span.cls).map(span => [span.text, span.cls]));
+  colorRows(rows, "src/a.ts", 2);
+  assert.equal(rows[2].spans, undefined, "Rows past the shown page wait");
+  colorRows(rows, "src/a.ts");
+  assert.ok(rows.every(row => row.kind === "@" || row.spans.map(span => span.text).join("") === row.text), "The pieces are the row's exact text");
+  assert.equal(classes(rows[1]), JSON.stringify([["const", "keyword"], ["1", "number"]]), "An added row is not inside the removed side's comment");
+  assert.equal(rows[2].spans[0].cls, "comment", "The removed side continues its own comment");
+  assert.equal(classes(rows[3]), JSON.stringify([["call", "function"], ["\"s\"", "string"]]));
+  assert.notEqual(rows[5].spans[0].cls, "comment", "A hunk starts with no open comment");
+  const plain = [{ kind: "+", text: "just text" }];
+  colorRows(plain, "notes.unknown");
+  assert.equal(plain[0].spans, undefined, "A file of no known language stays plain");
+  const long = [{ kind: "+", text: `x = "${"a".repeat(700)}" + y` }];
+  colorRows(long, "a.py");
+  assert.equal(long[0].spans.map(span => span.text).join(""), long[0].text, "A string that ends past the 600-character limit is not repeated");
 });
 
 test("Show in diff opens the thread's file, saves the draft, and starts the diff at its hunk", async () => {

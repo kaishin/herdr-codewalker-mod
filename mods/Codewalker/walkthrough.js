@@ -2,7 +2,7 @@ import { div, svg } from "gpui-kit";
 import { h_flex, v_flex, v_resizable, resizable_panel, Button, TextView } from "gpui-base";
 import { theme, settings } from "herdr";
 import { excerptRows, viewLabel, stepActivity, sortWalkthroughs } from "./walkthrough-model.js";
-import { splitPath, timestamp } from "./model.js";
+import { splitPath, timestamp, colorRows } from "./model.js";
 
 // The walkthrough pane reuses Review's parts: its buttons, diff rows, message
 // views, composer and Send. The host owns all state and every write.
@@ -92,7 +92,7 @@ function outline(host, walkthrough, at, wide, cx) {
 }
 
 function excerpt(host, step) {
-  const t = theme(), label = viewLabel(step.view), rows = excerptRows(step.view);
+  const t = theme(), label = viewLabel(step.view), rows = colorRows(excerptRows(step.view), step.view?.path);
   if (!label || !rows.length) return null;
   const { name, dir } = splitPath(label.path), stale = step.validity === "stale";
   return v_flex().id(`walkthrough-excerpt-${step.id}`).mx(16).my(8).rounded(8).border_1().border_color(t.border).overflow_hidden()

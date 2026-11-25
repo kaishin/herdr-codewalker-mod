@@ -7,7 +7,7 @@ import { History } from "./history.js";
 import { dockExpand, RESTORE_TIMEOUT } from "./dock-expand.js";
 import { walkthroughBody, walkthroughList } from "./walkthrough.js";
 import { stepIndex } from "./walkthrough-model.js";
-import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, activeThreads, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody, quote } from "./model.js";
+import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, activeThreads, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody, quote, colorRows, syntaxColors } from "./model.js";
 
 const stop = (_event, cx) => cx.stop_propagation();
 // Recently viewed diffs for the current snapshot only; bounded by files and rows.
@@ -1694,7 +1694,7 @@ export default class Codewalker extends View {
 
   // `corner`: round the bottom of the last row in a bordered card, which does not clip.
   diffRow(row, index, marked, live, corner = 0) {
-    const t = theme(), look = settings(), mono = look.font_family, fontSize = look.font_size ?? 12;
+    const t = theme(), look = settings(), mono = look.font_family, fontSize = look.font_size ?? 12, colors = syntaxColors(t);
     // Follow Herdr's live code size; leave room for the 16px hover button and larger fonts.
     const rowH = Math.max(18, Math.ceil(fontSize * 1.5)), minus = row.kind === "-", plus = row.kind === "+";
     if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(Math.max(26, rowH)).px(12).items_center().bg(t.raised).when(corner > 0, el => el.rounded_b(corner))
@@ -1717,7 +1717,11 @@ export default class Codewalker extends View {
         .child(number("old", row.oldLine)).child(number("new", row.newLine)))
       .child(comment)
       .child(div().w(SIGN_W).flex_none().text_color(tone ?? t.dim).child(plus ? "+" : minus ? "−" : ""))
-      .child(div().flex_1().min_w(0).pr(this.cols.edge).text_color(t.foreground).child(row.text || " "));
+      .child(row.spans?.length > 1 || row.spans?.[0]?.cls
+        // Colored pieces wrap between pieces; a piece wider than the row wraps inside itself.
+        ? h_flex().flex_1().min_w(0).flex_wrap().pr(this.cols.edge).text_color(t.foreground)
+          .children(row.spans.map(span => span.cls ? div().text_color(colors[span.cls] ?? t.foreground).child(span.text) : div().child(span.text)))
+        : div().flex_1().min_w(0).pr(this.cols.edge).text_color(t.foreground).child(row.text || " "));
   }
 
   // Path rows share one shape: status, name, folder, then discussion and line counts.
@@ -1811,6 +1815,7 @@ export default class Codewalker extends View {
     const currentThreads = this.threads.filter(thread => thread.path === this.file && (shownThreads.includes(thread)
       || thread.id === this.focusThread || thread.id === this.intent?.threadId || thread.messages.some(message => message.id === this.editing?.id)));
     const visible = pageRows(this.rows, this.page, PAGE_ROWS, this.from), rendered = new Set(), live = this.canAnchor(), marked = this.marking();
+    colorRows(this.rows, this.file, visible.start + visible.rows.length);
     const content = [];
     for (let i = 0; i < visible.rows.length; i++) {
       const row = visible.rows[i], index = visible.start + i;

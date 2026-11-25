@@ -1,5 +1,32 @@
 // Pure review presentation helpers. The Python helper remains the source of truth.
+import { tokenize, languageOf } from "./highlight.js";
+
 export const PAGE_ROWS = 240;
+
+// Syntax colors for diff rows: each row gets `spans` ([{ text, cls }]) once, in order, up to `end`,
+// so a long diff is colored only as far as it is shown. Removed rows and the new side keep their
+// own open comment or string; context rows continue both; a hunk row starts both again.
+const coloring = new WeakMap();
+export function colorRows(rows, path, end = rows.length) {
+  let at = coloring.get(rows);
+  if (!at) coloring.set(rows, at = { lang: path ? languageOf(path) : null, next: 0, old: null, now: null });
+  if (!at.lang) return rows;
+  for (; at.next < Math.min(end, rows.length); at.next++) {
+    const row = rows[at.next];
+    if (row.kind === "@") { at.old = at.now = null; continue; }
+    const minus = row.kind === "-", result = tokenize(row.text ?? "", at.lang, minus ? at.old : at.now);
+    row.spans = result.spans;
+    if (minus) at.old = result.state;
+    else { at.now = result.state; if (row.kind !== "+") at.old = result.state; }
+  }
+  return rows;
+}
+
+// Token colors from the Herdr theme's ANSI colors, so light and dark themes both read. No red:
+// it is the removed lines' color.
+export function syntaxColors(t) {
+  return { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi3, boolean: t.ansi3, variable: t.ansi6 };
+}
 
 export function newId() {
   return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;

@@ -1,5 +1,9 @@
 # Bundle Update Log
 
+## 2026-11-25
+
+- **Change**: Diff rows and walkthrough excerpts have syntax colors from herdr-reviewer's line tokenizer (`highlight.js`, MIT, `LICENSE-reviewer`) in theme ANSI colors without red. Rows are colored once, only as far as shown. The test loader in `tests/test_ui.mjs` now links each module once, from the top, because `model.js` has an import. `scripts/check-ui.py` reads a colored row's text joined. With a load average near 20, `herdr-app check` sometimes interrupted a render on its time limit; scene times matched the previous commit.
+
 ## 2026-11-24
 
 - **Decision**: Walkthroughs freeze their excerpts, use each step thread's first message as the step body, are linear, and are written only by agents. Per-person progress is deferred. See [walkthroughs](/walkthroughs.md).

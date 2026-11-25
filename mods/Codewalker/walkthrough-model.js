@@ -3,14 +3,18 @@
 const KIND = { add: "+", delete: "-", context: " ", meta: "" };
 
 // A step's frozen hunks as Review diff rows. Hunks that are not adjacent get a
-// separator row, so a gap in the code is never shown as continuous lines.
+// separator row, so a gap in the code is never shown as continuous lines. Built
+// once per view, so the rows keep their syntax colors across renders.
+const built = new WeakMap();
 export function excerptRows(view) {
+  if (view && built.has(view)) return built.get(view);
   const rows = [];
   (view?.hunks ?? []).forEach((hunk, index) => {
     const first = hunk.rows.find(row => row.oldLine || row.newLine);
     if (index > 0) rows.push({ kind: "@", text: first ? `⋯ ${first.newLine ? `line ${first.newLine}` : `old line ${first.oldLine}`}` : "⋯" });
     for (const row of hunk.rows) rows.push({ ...row, kind: KIND[row.kind] ?? row.kind });
   });
+  if (view) built.set(view, rows);
   return rows;
 }
 
